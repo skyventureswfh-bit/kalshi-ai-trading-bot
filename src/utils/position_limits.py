@@ -395,11 +395,23 @@ async def enforce_limits_if_needed(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
 ) -> bool:
+    """Return whether position-count state is safe without pretending exits happened.
+
+    ``True`` means the account is below the hard open-position limit. ``False``
+    means new entries must remain blocked. When the account is over the limit,
+    exit candidates are identified, but this helper stays false until confirmed
+    exchange exits actually reduce the local open-position count.
+    """
     manager = PositionLimitsManager(db_manager, kalshi_client)
     current_count = await manager._get_position_count()
+
     if current_count > manager.max_positions:
-        result = await manager.enforce_position_limits()
-        return result.get("action") == "no_action_needed"
+        await manager.enforce_position_limits()
+        return False
+
+    if current_count == manager.max_positions:
+        return False
+
     return True
 
 
