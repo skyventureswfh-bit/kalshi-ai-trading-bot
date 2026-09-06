@@ -29,6 +29,7 @@ from src.utils.kalshi_normalization import (
     get_market_status,
     get_mid_price,
 )
+from src.utils.live_exit import execute_confirmed_live_exit
 from src.utils.trade_pricing import FeeMetadata, calculate_position_pnl, extract_fee_metadata
 from src.utils.logging_setup import get_trading_logger, setup_logging
 
@@ -122,9 +123,6 @@ async def should_exit_position(
             exit_price = current_price
         return True, "market_resolution", exit_price
 
-    # Heal exit levels persisted by the old inverted NO-side calculator so
-    # legacy positions don't keep stopping out winners / "taking profit" on
-    # losers. Levels are mirrored back around the entry price.
     if position.stop_loss_price or position.take_profit_price:
         from src.utils.stop_loss_calculator import StopLossCalculator as _SLC
 
@@ -154,13 +152,7 @@ async def should_exit_position(
             return True, f"stop_loss_triggered_pnl_{expected_pnl:.2f}", current_price
 
     if position.take_profit_price:
-        # Side-symmetric: current_price is in the held side's price space, so
-        # profit is always the price rising above the target.
         if current_price >= position.take_profit_price:
-            # Fee-avoidance: a near-certain winner is worth more held to
-            # settlement (fee-free, pays $1) than sold early (exit fee plus
-            # spread for a few cents of protection). The stop-loss still
-            # guards against a genuine reversal.
             hold_threshold = float(
                 getattr(settings.trading, "hold_winners_to_settlement_price", 0.95) or 0.95
             )
@@ -414,10 +406,30 @@ async def run_tracking(
                     )
 
                     if live_mode:
+                        confirmed_exit_price = exit_price
+                        confirmed_exit_quantity = position.quantity
+
+                        if exit_reason != "market_resolution":
+                            live_exit = await execute_confirmed_live_exit(
+                                position=position,
+                                market_info=market_data,
+                                kalshi_client=kalshi_client,
+                            )
+                            if not live_exit.filled:
+                                logger.error(
+                                    "LIVE EXIT NOT FILLED for %s via %s; keeping local position OPEN (%s)",
+                                    position.market_id,
+                                    exit_reason,
+                                    live_exit.reason,
+                                )
+                                continue
+                            confirmed_exit_price = live_exit.fill_price
+                            confirmed_exit_quantity = live_exit.filled_quantity
+
                         pnl_details = calculate_position_pnl(
                             entry_price=position.entry_price,
-                            exit_price=exit_price,
-                            quantity=position.quantity,
+                            exit_price=confirmed_exit_price,
+                            quantity=confirmed_exit_quantity,
                             entry_maker=_position_was_maker_entry(position),
                             exit_maker=False,
                             charge_entry_fee=True,
@@ -435,8 +447,8 @@ async def run_tracking(
                             market_id=position.market_id,
                             side=position.side,
                             entry_price=position.entry_price,
-                            exit_price=exit_price,
-                            quantity=position.quantity,
+                            exit_price=confirmed_exit_price,
+                            quantity=confirmed_exit_quantity,
                             pnl=pnl_details["net_pnl"],
                             entry_timestamp=position.timestamp,
                             exit_timestamp=datetime.now(),
@@ -447,7 +459,7 @@ async def run_tracking(
                             contracts_cost=(
                                 position.contracts_cost
                                 if position.contracts_cost > 0
-                                else position.entry_price * position.quantity
+                                else position.entry_price * confirmed_exit_quantity
                             ),
                             live=True,
                             strategy=position.strategy,
@@ -462,7 +474,7 @@ async def run_tracking(
                             db_path=getattr(db_manager, "db_path", None),
                         )
                         logger.info(
-                            "Position for market %s closed via %s. PnL: $%.2f",
+                            "Position for market %s closed via %s after confirmed exchange exit. PnL: $%.2f",
                             position.market_id,
                             exit_reason,
                             float(pnl_details["net_pnl"]),
