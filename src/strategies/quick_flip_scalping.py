@@ -565,6 +565,49 @@ class QuickFlipScalpingStrategy:
 
         return None
 
+    @staticmethod
+    def _fill_identity(fill: Dict[str, Any]) -> Tuple[Any, ...]:
+        """Return a stable best-effort identity for live/history fill deduplication."""
+        explicit_id = fill.get("fill_id") or fill.get("trade_id")
+        if explicit_id not in (None, ""):
+            return ("id", str(explicit_id))
+        return (
+            "fallback",
+            str(fill.get("order_id") or ""),
+            str(fill.get("client_order_id") or ""),
+            str(fill.get("ticker") or ""),
+            str(fill.get("side") or "").lower(),
+            str(fill.get("action") or "").lower(),
+            str(fill.get("count") or fill.get("quantity") or ""),
+            str(fill.get("yes_price_dollars") or fill.get("yes_price") or ""),
+            str(fill.get("no_price_dollars") or fill.get("no_price") or ""),
+            str(fill.get("ts") or fill.get("created_time") or ""),
+        )
+
+    def _dedupe_position_fills(
+        self,
+        fills: List[Dict[str, Any]],
+        position: Position,
+    ) -> List[Dict[str, Any]]:
+        """Keep unique fills that can belong to this ticker and contract side."""
+        target_ticker = str(position.market_id or "")
+        target_side = str(position.side or "").lower()
+        seen = set()
+        unique: List[Dict[str, Any]] = []
+        for fill in fills:
+            ticker = str(fill.get("ticker") or "")
+            if ticker and ticker != target_ticker:
+                continue
+            side = str(fill.get("side") or "").lower()
+            if side and target_side and side != target_side:
+                continue
+            key = self._fill_identity(fill)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(fill)
+        return unique
+
     async def _find_order_snapshot(
         self,
         *,
@@ -959,6 +1002,8 @@ class QuickFlipScalpingStrategy:
                 f"Historical fills unavailable for {position.market_id}: {exc}"
             )
 
+        fills = self._dedupe_position_fills(fills, position)
+
         entry_ts = position.timestamp
         if entry_ts.tzinfo is None:
             entry_ts = entry_ts.replace(tzinfo=timezone.utc)
@@ -974,11 +1019,24 @@ class QuickFlipScalpingStrategy:
             for fill in relevant_fills
             if str(fill.get("action", "")).lower() == "sell"
         ]
-        buy_fills = [
+        buy_candidates = [
             fill
             for fill in relevant_fills
             if str(fill.get("action", "")).lower() == "buy"
         ]
+        if position.entry_order_id:
+            entry_order_id = str(position.entry_order_id)
+            buy_fills = [
+                fill
+                for fill in buy_candidates
+                if entry_order_id
+                in {
+                    str(fill.get("order_id") or ""),
+                    str(fill.get("client_order_id") or ""),
+                }
+            ]
+        else:
+            buy_fills = buy_candidates
         if not sell_fills:
             return False
 
@@ -2068,7 +2126,7 @@ Respond with JSON only:
                     f"target=${sell_price:.4f}"
                 )
             self.logger.info(
-                f"Sell order placed: {position.side} {position.quantity} "
+                f"Sell order placed: {opportunity.side} {opportunity.quantity} "
                 f"at ${sell_price:.4f} for {opportunity.market_id}"
             )
             return {
