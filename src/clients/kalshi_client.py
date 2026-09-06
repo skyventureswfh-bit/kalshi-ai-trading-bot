@@ -424,7 +424,7 @@ class KalshiClient(TradingLoggerMixin):
         buy_max_cost: Optional[int] = None,
         sell_position_floor: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Place a docs-compatible limit order."""
+        """Place a docs-compatible limit order with a final live-buy safety gate."""
         normalized_count = format_count_fp(count)
         order_data: Dict[str, Any] = {
             "ticker": ticker,
@@ -460,6 +460,68 @@ class KalshiClient(TradingLoggerMixin):
             order_data["buy_max_cost"] = int(buy_max_cost)
         if sell_position_floor is not None:
             order_data["sell_position_floor"] = int(sell_position_floor)
+
+        # Final money gate: every live BUY must still satisfy the protected
+        # reserve, per-trade cap, and daily realized-loss cap immediately before
+        # the exchange POST. SELL orders are intentionally exempt so safety
+        # controls can never prevent reducing risk or exiting a position.
+        if str(action or "").lower() == "buy":
+            try:
+                if str(side or "").lower() == "no":
+                    if no_price_dollars is not None:
+                        unit_price = float(no_price_dollars)
+                    elif no_price is not None:
+                        unit_price = float(no_price) / 100.0
+                    else:
+                        unit_price = 0.0
+                else:
+                    if yes_price_dollars is not None:
+                        unit_price = float(yes_price_dollars)
+                    elif yes_price is not None:
+                        unit_price = float(yes_price) / 100.0
+                    else:
+                        unit_price = 0.0
+
+                proposed_trade_value = max(0.0, float(count) * unit_price)
+                if buy_max_cost is not None and buy_max_cost > 0:
+                    proposed_trade_value = max(
+                        proposed_trade_value,
+                        float(buy_max_cost) / 100.0,
+                    )
+
+                from src.utils.cash_reserves import CashReservesManager
+                from src.utils.database import DatabaseManager
+
+                safety_db = DatabaseManager()
+                reserve_manager = CashReservesManager(safety_db, self)
+                reserve_check = await reserve_manager.check_cash_reserves(
+                    proposed_trade_value=proposed_trade_value
+                )
+                if not reserve_check.can_trade:
+                    self.logger.warning(
+                        "Live buy blocked by final capital safety gate",
+                        ticker=ticker,
+                        side=side,
+                        proposed_trade_value=proposed_trade_value,
+                        reason=reserve_check.reason,
+                    )
+                    raise KalshiAPIError(
+                        f"Live buy blocked by capital safety gate: {reserve_check.reason}"
+                    )
+            except KalshiAPIError:
+                raise
+            except Exception as exc:
+                # This gate is fail-closed. If the safety state cannot be read,
+                # do not send a new-money order to the exchange.
+                self.logger.error(
+                    "Final capital safety gate failed; blocking live buy",
+                    ticker=ticker,
+                    side=side,
+                    error=str(exc),
+                )
+                raise KalshiAPIError(
+                    f"Live buy blocked because capital safety could not be verified: {exc}"
+                ) from exc
 
         return await self._make_authenticated_request(
             "POST", "/trade-api/v2/portfolio/orders", json_data=order_data
