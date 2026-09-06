@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unified Advanced Trading System - The Beast Mode
 
 This system orchestrates all cutting-edge strategies:
@@ -416,7 +416,7 @@ class UnifiedAdvancedTradingSystem:
                 self.logger.warning(f"No allocations to execute. Allocation exists: {allocation is not None}, Has allocations: {bool(allocation and allocation.allocations)}")
             
             self.logger.info(
-                f"Directional Trading: {len(allocation.allocations)} positions, "
+                f"Directional Allocation Plan: {len(allocation.allocations)} positions, "
                 f"${allocation.total_capital_used:.0f} allocated, "
                 f"Sharpe: {allocation.portfolio_sharpe:.2f}"
             )
@@ -568,8 +568,7 @@ class UnifiedAdvancedTradingSystem:
                     
                     if existing_position:
                         self.logger.info(f"SKIPPING {market_id} {intended_side} - exact position already exists (likely from immediate trade)")
-                        results['positions_created'] += 1  # Count as created since it exists
-                        results['total_capital_used'] += allocation_fraction * self.directional_capital
+                        # Existing position was not created by this allocation pass.
                         continue
                     else:
                         # Check if we have the opposite side (just for logging)
@@ -1002,4 +1001,3 @@ async def run_unified_trading_system(
     except Exception as e:
         logger.error(f"Error in unified trading system: {e}")
         return TradingSystemResults() 
-
