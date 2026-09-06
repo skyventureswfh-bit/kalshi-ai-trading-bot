@@ -461,10 +461,31 @@ class AdvancedMarketMaker:
         self,
         markets: List[Market],
     ) -> List[MarketMakingOpportunity]:
-        """Analyze markets for market-making opportunities."""
+        """Analyze a bounded, high-volume candidate pool for market-making opportunities."""
         opportunities = []
 
-        for market in markets:
+        max_execution_markets = max(
+            1,
+            int(getattr(settings.trading, "max_concurrent_markets", 10)),
+        )
+        analysis_limit = max_execution_markets * 3
+        ranked_markets = sorted(
+            markets,
+            key=lambda market: int(getattr(market, "volume", 0) or 0),
+            reverse=True,
+        )
+        markets_to_analyze = ranked_markets[:analysis_limit]
+
+        if len(markets) > len(markets_to_analyze):
+            self.logger.info(
+                "Market-making analysis capped at %s of %s eligible markets "
+                "(top volume candidates; execution limit=%s)",
+                len(markets_to_analyze),
+                len(markets),
+                max_execution_markets,
+            )
+
+        for market in markets_to_analyze:
             try:
                 market_data = await self.kalshi_client.get_market(market.market_id)
                 market_info = market_data.get("market", {}) if isinstance(market_data, dict) else {}
