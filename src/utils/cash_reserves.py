@@ -1,5 +1,5 @@
 """
-Cash reserve and daily-loss safety brakes for the trading system.
+Cash reserve, daily-loss, and drawdown safety brakes for the trading system.
 
 Defaults are intentionally conservative and can be adjusted with environment
 variables. The reserve is treated as untouchable capital for new trades.
@@ -12,6 +12,7 @@ Environment variables:
 - MAX_SINGLE_TRADE_IMPACT_PCT (default: 5.0)
 - DAILY_LOSS_CAP_PCT (default: 3.0)
 - DAILY_LOSS_CAP_DOLLARS (default: 0; disabled when 0)
+- MAX_DRAWDOWN_PCT (default: 15.0; enforced by DrawdownGuard)
 """
 
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ import aiosqlite
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from src.utils.database import DatabaseManager
+from src.utils.drawdown_guard import check_drawdown_guard
 from src.utils.kalshi_normalization import (
     get_balance_dollars,
     get_portfolio_value_dollars,
@@ -60,7 +62,7 @@ class CashEmergencyAction:
 
 
 class CashReservesManager:
-    """Central safety manager for protected cash and daily realized-loss limits."""
+    """Central safety manager for protected cash, daily loss, and drawdown limits."""
 
     def __init__(self, db_manager: DatabaseManager, kalshi_client: KalshiClient):
         self.db_manager = db_manager
@@ -135,13 +137,19 @@ class CashReservesManager:
             cash_after_trade = current_cash - proposed_trade_value
             reserve_after_trade = (cash_after_trade / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
+            drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
 
             recommendations: List[str] = []
             can_trade = True
             emergency_status = False
-            reason = "Cash reserves and daily loss limit are adequate"
+            reason = "Cash reserves, daily loss, and drawdown limits are adequate"
 
-            if daily["daily_loss_halt"]:
+            if not drawdown.can_trade:
+                can_trade = False
+                emergency_status = True
+                reason = drawdown.reason
+                recommendations.append("HALT all new risk until drawdown safety is cleared")
+            elif daily["daily_loss_halt"]:
                 can_trade = False
                 emergency_status = True
                 reason = (
@@ -228,6 +236,16 @@ class CashReservesManager:
             current_cash = await self._get_available_cash()
             current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
+            drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
+
+            if not drawdown.can_trade:
+                return CashEmergencyAction(
+                    action_type="halt_trading",
+                    urgency="critical",
+                    positions_to_close=0,
+                    expected_cash_freed=0.0,
+                    reason=drawdown.reason,
+                )
 
             if daily["daily_loss_halt"]:
                 return CashEmergencyAction(
@@ -289,8 +307,11 @@ class CashReservesManager:
             current_cash = await self._get_available_cash()
             current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
+            drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
 
-            if daily["daily_loss_halt"]:
+            if not drawdown.can_trade:
+                status = "DRAWDOWN_HALT"
+            elif daily["daily_loss_halt"]:
                 status = "DAILY_LOSS_HALT"
             elif current_reserve_pct >= self.optimal_reserve_pct:
                 status = "EXCELLENT"
@@ -305,7 +326,11 @@ class CashReservesManager:
 
             minimum_cash = portfolio_value * self.minimum_reserve_pct / 100.0
             optimal_cash = portfolio_value * self.optimal_reserve_pct / 100.0
-            emergency = bool(daily["daily_loss_halt"] or current_reserve_pct < self.emergency_threshold_pct)
+            emergency = bool(
+                (not drawdown.can_trade)
+                or daily["daily_loss_halt"]
+                or current_reserve_pct < self.emergency_threshold_pct
+            )
 
             return {
                 "status": status,
@@ -316,10 +341,22 @@ class CashReservesManager:
                 "optimal_target": self.optimal_reserve_pct,
                 "cash_shortfall": max(0.0, minimum_cash - current_cash),
                 "cash_to_optimal": max(0.0, optimal_cash - current_cash),
-                "trading_permitted": current_reserve_pct >= self.minimum_reserve_pct and not daily["daily_loss_halt"],
+                "trading_permitted": (
+                    current_reserve_pct >= self.minimum_reserve_pct
+                    and not daily["daily_loss_halt"]
+                    and drawdown.can_trade
+                ),
                 "emergency_status": emergency,
                 "max_trade_size": max(0.0, current_cash - minimum_cash),
-                "recommendations": self._get_cash_recommendations(current_reserve_pct, daily),
+                "drawdown_pct": drawdown.drawdown_pct,
+                "drawdown_limit_pct": drawdown.limit_pct,
+                "high_watermark": drawdown.high_watermark,
+                "drawdown_reason": drawdown.reason,
+                "recommendations": (
+                    ["DRAWDOWN HALT: no new risk until drawdown safety is cleared"]
+                    if not drawdown.can_trade
+                    else self._get_cash_recommendations(current_reserve_pct, daily)
+                ),
                 **daily,
             }
         except Exception as exc:
