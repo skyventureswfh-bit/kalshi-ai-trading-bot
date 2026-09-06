@@ -2,6 +2,14 @@
 
 Safety modules should reason about one consistent account state per decision
 instead of independently re-fetching balance and positions several times.
+
+Kalshi's ``GET /portfolio/balance`` response separates:
+- ``balance``: available cash
+- ``portfolio_value``: current value of positions held
+
+The second field does not include available cash, so total account equity for
+our safety math is ``balance + portfolio_value``. Keep this distinction explicit
+so a future refactor does not accidentally undercount or double-count capital.
 """
 
 from __future__ import annotations
@@ -25,12 +33,14 @@ class AccountSafetySnapshot:
 async def get_account_safety_snapshot(
     kalshi_client: KalshiClient,
 ) -> AccountSafetySnapshot:
-    """Fetch one consistent cash/portfolio snapshot for a safety decision."""
+    """Fetch one consistent cash/total-equity snapshot for a safety decision."""
     balance = await kalshi_client.get_balance()
     available_cash = get_balance_dollars(balance)
     marked_value = get_portfolio_value_dollars(balance)
 
     if marked_value > 0:
+        # Kalshi documents portfolio_value as the value of held positions only.
+        # Total account equity therefore includes available cash plus that value.
         portfolio_value = available_cash + marked_value
     else:
         positions_response = await kalshi_client.get_positions()
