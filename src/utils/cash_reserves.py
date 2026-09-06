@@ -25,13 +25,9 @@ import aiosqlite
 
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
+from src.utils.account_snapshot import AccountSafetySnapshot, get_account_safety_snapshot
 from src.utils.database import DatabaseManager
 from src.utils.drawdown_guard import check_drawdown_guard
-from src.utils.kalshi_normalization import (
-    get_balance_dollars,
-    get_portfolio_value_dollars,
-    get_position_exposure_dollars,
-)
 from src.utils.logging_setup import get_trading_logger
 from src.utils.position_limits import PositionLimitsManager
 
@@ -128,22 +124,30 @@ class CashReservesManager:
         self,
         proposed_trade_value: float = 0.0,
         portfolio_value: Optional[float] = None,
+        snapshot: Optional[AccountSafetySnapshot] = None,
     ) -> CashReserveResult:
         try:
+            snapshot = snapshot or await get_account_safety_snapshot(self.kalshi_client)
             if portfolio_value is None:
-                portfolio_value = await self._get_portfolio_value()
-            current_cash = await self._get_available_cash()
+                portfolio_value = snapshot.portfolio_value
+            current_cash = snapshot.available_cash
             current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             cash_after_trade = current_cash - proposed_trade_value
             reserve_after_trade = (cash_after_trade / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
-            drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
+            drawdown = await check_drawdown_guard(
+                self.db_manager,
+                self.kalshi_client,
+                snapshot=snapshot,
+            )
             position_limits = await PositionLimitsManager(
                 self.db_manager,
                 self.kalshi_client,
             ).check_position_limits(
                 proposed_position_size=proposed_trade_value,
                 portfolio_value=portfolio_value,
+                available_cash=current_cash,
+                snapshot=snapshot,
             )
 
             recommendations: List[str] = []
@@ -243,11 +247,16 @@ class CashReservesManager:
 
     async def handle_cash_emergency(self) -> CashEmergencyAction:
         try:
-            portfolio_value = await self._get_portfolio_value()
-            current_cash = await self._get_available_cash()
+            snapshot = await get_account_safety_snapshot(self.kalshi_client)
+            portfolio_value = snapshot.portfolio_value
+            current_cash = snapshot.available_cash
             current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
-            drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
+            drawdown = await check_drawdown_guard(
+                self.db_manager,
+                self.kalshi_client,
+                snapshot=snapshot,
+            )
 
             if not drawdown.can_trade:
                 return CashEmergencyAction(
@@ -313,11 +322,16 @@ class CashReservesManager:
 
     async def get_cash_status(self) -> Dict[str, Any]:
         try:
-            portfolio_value = await self._get_portfolio_value()
-            current_cash = await self._get_available_cash()
+            snapshot = await get_account_safety_snapshot(self.kalshi_client)
+            portfolio_value = snapshot.portfolio_value
+            current_cash = snapshot.available_cash
             current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
-            drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
+            drawdown = await check_drawdown_guard(
+                self.db_manager,
+                self.kalshi_client,
+                snapshot=snapshot,
+            )
 
             if not drawdown.can_trade:
                 status = "DRAWDOWN_HALT"
@@ -381,28 +395,10 @@ class CashReservesManager:
             }
 
     async def _get_portfolio_value(self) -> float:
-        try:
-            balance_response = await self.kalshi_client.get_balance()
-            available_cash = get_balance_dollars(balance_response)
-            marked_portfolio_value = get_portfolio_value_dollars(balance_response)
-            if marked_portfolio_value > 0:
-                return available_cash + marked_portfolio_value
-
-            positions_response = await self.kalshi_client.get_positions()
-            positions = positions_response.get("event_positions", []) if isinstance(positions_response, dict) else []
-            position_value = sum(
-                get_position_exposure_dollars(position)
-                for position in positions
-                if isinstance(position, dict)
-            )
-            return available_cash + position_value
-        except Exception as exc:
-            self.logger.error(f"Error calculating portfolio value: {exc}")
-            raise
+        return (await get_account_safety_snapshot(self.kalshi_client)).portfolio_value
 
     async def _get_available_cash(self) -> float:
-        balance_response = await self.kalshi_client.get_balance()
-        return get_balance_dollars(balance_response)
+        return (await get_account_safety_snapshot(self.kalshi_client)).available_cash
 
     def _get_cash_recommendations(self, reserve_pct: float, daily: Optional[Dict[str, Any]] = None) -> List[str]:
         daily = daily or {}
