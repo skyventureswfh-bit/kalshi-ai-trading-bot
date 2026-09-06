@@ -1,36 +1,45 @@
 """
-Cash Reserves Management Module
+Cash reserve and daily-loss safety brakes for the trading system.
 
-Implements the 15% minimum cash reserve requirement recommended by Grok4 performance analysis.
-Provides systematic cash management across all trading strategies to prevent liquidity crises.
+Defaults are intentionally conservative and can be adjusted with environment
+variables. The reserve is treated as untouchable capital for new trades.
 
-Key Features:
-- 15% minimum cash reserve enforcement
-- Emergency trading halt when reserves critical
-- Integration with position limits system
-- Real-time cash monitoring and alerts
-- Automatic position closure for reserves
+Environment variables:
+- MIN_CASH_RESERVE_PCT (default: 33.0)
+- OPTIMAL_CASH_RESERVE_PCT (default: 40.0)
+- EMERGENCY_CASH_RESERVE_PCT (default: 25.0)
+- CRITICAL_CASH_RESERVE_PCT (default: 15.0)
+- MAX_SINGLE_TRADE_IMPACT_PCT (default: 5.0)
+- DAILY_LOSS_CAP_PCT (default: 3.0)
+- DAILY_LOSS_CAP_DOLLARS (default: 0; disabled when 0)
 """
 
-from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-import asyncio
+from typing import Any, Dict, List, Optional, Tuple
+import os
 
-from src.utils.database import DatabaseManager
+import aiosqlite
+
 from src.clients.kalshi_client import KalshiClient
+from src.config.settings import settings
+from src.utils.database import DatabaseManager
 from src.utils.kalshi_normalization import (
     get_balance_dollars,
     get_portfolio_value_dollars,
     get_position_exposure_dollars,
 )
 from src.utils.logging_setup import get_trading_logger
-from src.config.settings import settings
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
 class CashReserveResult:
-    """Result of cash reserve checking."""
     can_trade: bool
     reason: str
     current_cash: float
@@ -43,114 +52,153 @@ class CashReserveResult:
 
 @dataclass
 class CashEmergencyAction:
-    """Emergency action for cash reserves."""
-    action_type: str  # "close_positions", "halt_trading", "raise_alert"
-    urgency: str     # "critical", "warning", "info"
+    action_type: str  # close_positions | halt_trading | raise_alert | no_action
+    urgency: str
     positions_to_close: int
     expected_cash_freed: float
     reason: str
 
 
 class CashReservesManager:
-    """
-    Centralized cash reserves management following Grok4 recommendations.
-    
-    Implements systematic cash management to prevent liquidity crises and
-    maintain operational flexibility for opportunistic trades.
-    """
-    
+    """Central safety manager for protected cash and daily realized-loss limits."""
+
     def __init__(self, db_manager: DatabaseManager, kalshi_client: KalshiClient):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
         self.logger = get_trading_logger("cash_reserves")
-        
-        # UPDATED: Minimal cash reserve requirements for maximum deployment
-        self.minimum_reserve_pct = 0.5       # DECREASED: Only 0.5% minimum (was 1%)
-        self.optimal_reserve_pct = 1.0       # DECREASED: Only 1% optimal target (was 2%)
-        self.emergency_threshold_pct = 0.2   # DECREASED: 0.2% emergency halt (was 0.5%)
-        self.critical_threshold_pct = 0.05   # DECREASED: 0.05% critical threshold (was 0.1%)
-        
-        # Additional safety parameters - MORE AGGRESSIVE
-        self.max_single_trade_impact = 5.0   # INCREASED: Allow 5% portfolio impact per trade (was 3%)
-        self.buffer_for_opportunities = 0.5  # DECREASED: Only 0.5% buffer (was 1%)
-        
+
+        # Protected capital. Defaults to roughly one-third of the portfolio.
+        self.minimum_reserve_pct = _env_float("MIN_CASH_RESERVE_PCT", 33.0)
+        self.optimal_reserve_pct = _env_float("OPTIMAL_CASH_RESERVE_PCT", 40.0)
+        self.emergency_threshold_pct = _env_float("EMERGENCY_CASH_RESERVE_PCT", 25.0)
+        self.critical_threshold_pct = _env_float("CRITICAL_CASH_RESERVE_PCT", 15.0)
+
+        # Trade and session brakes.
+        self.max_single_trade_impact = _env_float("MAX_SINGLE_TRADE_IMPACT_PCT", 5.0)
+        self.buffer_for_opportunities = _env_float("CASH_OPPORTUNITY_BUFFER_PCT", 2.0)
+        self.daily_loss_cap_pct = max(0.0, _env_float("DAILY_LOSS_CAP_PCT", 3.0))
+        self.daily_loss_cap_dollars = max(0.0, _env_float("DAILY_LOSS_CAP_DOLLARS", 0.0))
+
+    def _daily_loss_limit_dollars(self, portfolio_value: float) -> float:
+        limits: List[float] = []
+        if self.daily_loss_cap_pct > 0 and portfolio_value > 0:
+            limits.append(portfolio_value * self.daily_loss_cap_pct / 100.0)
+        if self.daily_loss_cap_dollars > 0:
+            limits.append(self.daily_loss_cap_dollars)
+        return min(limits) if limits else 0.0
+
+    async def _get_daily_realized_pnl(self) -> float:
+        """Return today's realized P&L from local trade logs, split by live/paper mode."""
+        live_mode = bool(getattr(settings.trading, "live_trading_enabled", False))
+        try:
+            async with aiosqlite.connect(self.db_manager.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT COALESCE(SUM(pnl), 0.0)
+                    FROM trade_logs
+                    WHERE date(exit_timestamp) = date('now')
+                      AND live = ?
+                    """,
+                    (1 if live_mode else 0,),
+                )
+                row = await cursor.fetchone()
+                return float(row[0] or 0.0) if row else 0.0
+        except Exception as exc:
+            # Fail safe: an unreadable P&L ledger should not silently disable safety.
+            self.logger.error(f"Unable to read daily realized P&L: {exc}")
+            raise
+
+    async def _daily_loss_status(self, portfolio_value: float) -> Dict[str, Any]:
+        pnl = await self._get_daily_realized_pnl()
+        limit = self._daily_loss_limit_dollars(portfolio_value)
+        loss = max(0.0, -pnl)
+        hit = bool(limit > 0 and loss >= limit)
+        return {
+            "daily_realized_pnl": pnl,
+            "daily_realized_loss": loss,
+            "daily_loss_limit": limit,
+            "daily_loss_cap_pct": self.daily_loss_cap_pct,
+            "daily_loss_cap_dollars": self.daily_loss_cap_dollars,
+            "daily_loss_halt": hit,
+        }
+
     async def check_cash_reserves(
         self,
         proposed_trade_value: float = 0.0,
-        portfolio_value: Optional[float] = None
+        portfolio_value: Optional[float] = None,
     ) -> CashReserveResult:
-        """
-        Check if cash reserves meet requirements for trading.
-        
-        Args:
-            proposed_trade_value: Dollar value of proposed trade
-            portfolio_value: Total portfolio value (fetched if not provided)
-            
-        Returns:
-            CashReserveResult with decision and recommendations
-        """
         try:
-            # Get current portfolio state
             if portfolio_value is None:
                 portfolio_value = await self._get_portfolio_value()
-            
             current_cash = await self._get_available_cash()
-            current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0
-            
-            # Calculate cash after proposed trade
+            current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             cash_after_trade = current_cash - proposed_trade_value
-            reserve_after_trade = (cash_after_trade / portfolio_value) * 100 if portfolio_value > 0 else 0
-            
-            recommendations = []
+            reserve_after_trade = (cash_after_trade / portfolio_value) * 100 if portfolio_value > 0 else 0.0
+            daily = await self._daily_loss_status(portfolio_value)
+
+            recommendations: List[str] = []
             can_trade = True
-            reason = "Cash reserves adequate"
             emergency_status = False
-            
-            # Check 1: Current reserve level
-            if current_reserve_pct < self.critical_threshold_pct:
+            reason = "Cash reserves and daily loss limit are adequate"
+
+            if daily["daily_loss_halt"]:
                 can_trade = False
                 emergency_status = True
-                reason = f"CRITICAL: Cash reserves {current_reserve_pct:.1f}% below critical threshold {self.critical_threshold_pct:.1f}%"
-                recommendations.append("EMERGENCY: Close positions immediately to build cash reserves")
-                recommendations.append("HALT all new trading until reserves restored")
-                
+                reason = (
+                    f"DAILY LOSS HALT: realized loss ${daily['daily_realized_loss']:.2f} "
+                    f"reached ${daily['daily_loss_limit']:.2f} limit"
+                )
+                recommendations.append("HALT all new trading until the next UTC trading day")
+            elif current_reserve_pct < self.critical_threshold_pct:
+                can_trade = False
+                emergency_status = True
+                reason = (
+                    f"CRITICAL: cash reserves {current_reserve_pct:.1f}% below "
+                    f"{self.critical_threshold_pct:.1f}% threshold"
+                )
+                recommendations.extend([
+                    "HALT all new trading until reserves are restored",
+                    "Review open positions before freeing capital",
+                ])
             elif current_reserve_pct < self.emergency_threshold_pct:
                 can_trade = False
                 emergency_status = True
-                reason = f"EMERGENCY: Cash reserves {current_reserve_pct:.1f}% below emergency threshold {self.emergency_threshold_pct:.1f}%"
-                recommendations.append("Close 2-3 positions immediately")
-                recommendations.append("Suspend new trading until above 15%")
-                
+                reason = (
+                    f"EMERGENCY: cash reserves {current_reserve_pct:.1f}% below "
+                    f"{self.emergency_threshold_pct:.1f}% threshold"
+                )
+                recommendations.append("Suspend new trading and rebuild protected cash")
             elif reserve_after_trade < self.minimum_reserve_pct:
                 can_trade = False
-                reason = f"Trade would reduce reserves to {reserve_after_trade:.1f}%, below minimum {self.minimum_reserve_pct:.1f}%"
-                recommendations.append(f"Reduce trade size or close positions to maintain {self.minimum_reserve_pct:.1f}% reserves")
-                
+                reason = (
+                    f"Trade would reduce protected cash to {reserve_after_trade:.1f}%, "
+                    f"below {self.minimum_reserve_pct:.1f}% minimum"
+                )
+                recommendations.append("Reduce trade size; protected reserve is untouchable")
             elif current_reserve_pct < self.minimum_reserve_pct:
                 can_trade = False
-                reason = f"Current reserves {current_reserve_pct:.1f}% below minimum {self.minimum_reserve_pct:.1f}%"
-                recommendations.append("Build cash reserves before new trades")
-                recommendations.append("Consider closing lowest-performing positions")
-                
-            # Check 2: Trade size impact
-            trade_impact_pct = (proposed_trade_value / portfolio_value) * 100 if portfolio_value > 0 else 0
-            # Add small tolerance for floating point precision issues
-            if trade_impact_pct > (self.max_single_trade_impact + 0.01):
+                reason = (
+                    f"Current reserves {current_reserve_pct:.1f}% below protected "
+                    f"minimum {self.minimum_reserve_pct:.1f}%"
+                )
+                recommendations.append("No new positions until protected reserve is restored")
+
+            trade_impact_pct = (proposed_trade_value / portfolio_value) * 100 if portfolio_value > 0 else 0.0
+            if trade_impact_pct > self.max_single_trade_impact + 0.01:
                 can_trade = False
-                reason = f"Trade impact {trade_impact_pct:.1f}% exceeds maximum {self.max_single_trade_impact:.1f}%"
-                recommendations.append(f"Reduce trade size to maximum ${portfolio_value * self.max_single_trade_impact / 100:.2f}")
-            
-            # Check 3: Opportunity buffer
-            if reserve_after_trade < (self.minimum_reserve_pct + self.buffer_for_opportunities):
-                if can_trade:  # Only warn if not already blocked
-                    recommendations.append(f"Warning: Reserves would be {reserve_after_trade:.1f}%, limiting future opportunities")
-            
-            # Positive recommendations
-            if current_reserve_pct >= self.optimal_reserve_pct:
-                recommendations.append("Excellent cash position - ready for opportunities")
-            elif current_reserve_pct >= self.minimum_reserve_pct:
-                recommendations.append("Good cash reserves - trading permitted")
-            
+                reason = (
+                    f"Trade impact {trade_impact_pct:.1f}% exceeds "
+                    f"{self.max_single_trade_impact:.1f}% per-trade cap"
+                )
+                recommendations.append(
+                    f"Reduce trade to at most ${portfolio_value * self.max_single_trade_impact / 100:.2f}"
+                )
+
+            if can_trade and reserve_after_trade < self.minimum_reserve_pct + self.buffer_for_opportunities:
+                recommendations.append("Warning: trade would leave little cash above the protected reserve")
+            elif can_trade:
+                recommendations.append("Safety checks passed")
+
             return CashReserveResult(
                 can_trade=can_trade,
                 reason=reason,
@@ -159,97 +207,92 @@ class CashReservesManager:
                 cash_reserve_pct=current_reserve_pct,
                 required_reserve_pct=self.minimum_reserve_pct,
                 emergency_status=emergency_status,
-                recommended_actions=recommendations
+                recommended_actions=recommendations,
             )
-            
-        except Exception as e:
-            self.logger.error(f"Error checking cash reserves: {e}")
+        except Exception as exc:
+            self.logger.error(f"Error checking cash reserves: {exc}")
             return CashReserveResult(
                 can_trade=False,
-                reason=f"Error checking cash reserves: {e}",
+                reason=f"Safety check failed closed: {exc}",
                 current_cash=0.0,
                 portfolio_value=0.0,
                 cash_reserve_pct=0.0,
                 required_reserve_pct=self.minimum_reserve_pct,
                 emergency_status=True,
-                recommended_actions=["Review system errors", "Manual cash verification needed"]
+                recommended_actions=["HALT new trading until safety state can be verified"],
             )
-    
+
     async def handle_cash_emergency(self) -> CashEmergencyAction:
-        """
-        Handle cash reserve emergency by determining required actions.
-        
-        Returns:
-            CashEmergencyAction with specific emergency response
-        """
         try:
             portfolio_value = await self._get_portfolio_value()
             current_cash = await self._get_available_cash()
-            current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0
-            
-            # Calculate required cash to reach minimum reserves
-            required_cash = portfolio_value * (self.minimum_reserve_pct / 100)
-            cash_shortfall = required_cash - current_cash
-            
-            if current_reserve_pct >= self.minimum_reserve_pct:
+            current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
+            daily = await self._daily_loss_status(portfolio_value)
+
+            if daily["daily_loss_halt"]:
                 return CashEmergencyAction(
-                    action_type="no_action",
-                    urgency="info",
+                    action_type="halt_trading",
+                    urgency="critical",
                     positions_to_close=0,
                     expected_cash_freed=0.0,
-                    reason="Cash reserves adequate"
+                    reason=(
+                        f"Daily realized loss ${daily['daily_realized_loss']:.2f} reached "
+                        f"${daily['daily_loss_limit']:.2f} limit"
+                    ),
                 )
-            
-            # Determine urgency level
+
+            required_cash = portfolio_value * self.minimum_reserve_pct / 100.0
+            cash_shortfall = max(0.0, required_cash - current_cash)
+            if current_reserve_pct >= self.minimum_reserve_pct:
+                return CashEmergencyAction("no_action", "info", 0, 0.0, "Cash reserves adequate")
+
             if current_reserve_pct < self.critical_threshold_pct:
-                urgency = "critical"
-                action_type = "halt_trading"
+                action_type, urgency = "halt_trading", "critical"
             elif current_reserve_pct < self.emergency_threshold_pct:
-                urgency = "critical"
-                action_type = "close_positions"
+                action_type, urgency = "close_positions", "critical"
             else:
-                urgency = "warning"
-                action_type = "raise_alert"
-            
-            # Calculate positions to close
+                action_type, urgency = "raise_alert", "warning"
+
             positions = await self.db_manager.get_open_positions()
             positions_to_close = 0
             expected_cash_freed = 0.0
-            
-            # Estimate cash from closing positions (simplified)
-            if positions:
-                avg_position_value = 50.0  # Conservative estimate
-                positions_needed = max(1, int(cash_shortfall / avg_position_value))
-                positions_to_close = min(positions_needed, len(positions))
-                expected_cash_freed = positions_to_close * avg_position_value
-            
+            if positions and cash_shortfall > 0:
+                # Estimate only; actual exit execution remains the responsibility of the execution layer.
+                avg_position_value = sum(
+                    max(0.0, float(getattr(p, "entry_price", 0.0)) * float(getattr(p, "quantity", 0.0)))
+                    for p in positions
+                ) / max(1, len(positions))
+                if avg_position_value > 0:
+                    positions_to_close = min(len(positions), max(1, int((cash_shortfall / avg_position_value) + 0.999)))
+                    expected_cash_freed = positions_to_close * avg_position_value
+
             return CashEmergencyAction(
                 action_type=action_type,
                 urgency=urgency,
                 positions_to_close=positions_to_close,
                 expected_cash_freed=expected_cash_freed,
-                reason=f"Need ${cash_shortfall:.2f} to reach {self.minimum_reserve_pct:.1f}% reserves"
+                reason=f"Need ${cash_shortfall:.2f} to restore {self.minimum_reserve_pct:.1f}% protected reserve",
             )
-            
-        except Exception as e:
-            self.logger.error(f"Error handling cash emergency: {e}")
+        except Exception as exc:
+            self.logger.error(f"Error handling cash emergency: {exc}")
             return CashEmergencyAction(
                 action_type="halt_trading",
                 urgency="critical",
                 positions_to_close=0,
                 expected_cash_freed=0.0,
-                reason=f"Emergency handling error: {e}"
+                reason=f"Safety state unavailable: {exc}",
             )
-    
+
     async def get_cash_status(self) -> Dict[str, Any]:
-        """Get comprehensive cash reserves status."""
         try:
             portfolio_value = await self._get_portfolio_value()
             current_cash = await self._get_available_cash()
-            current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0
-            
-            # Determine status
-            if current_reserve_pct >= self.optimal_reserve_pct:
+            current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
+            daily = await self._daily_loss_status(portfolio_value)
+
+            if daily["daily_loss_halt"]:
+                status = "DAILY_LOSS_HALT"
+            elif current_reserve_pct >= self.optimal_reserve_pct:
                 status = "EXCELLENT"
             elif current_reserve_pct >= self.minimum_reserve_pct:
                 status = "GOOD"
@@ -259,97 +302,81 @@ class CashReservesManager:
                 status = "EMERGENCY"
             else:
                 status = "CRITICAL"
-            
-            # Calculate targets
-            optimal_cash = portfolio_value * (self.optimal_reserve_pct / 100)
-            minimum_cash = portfolio_value * (self.minimum_reserve_pct / 100)
-            
+
+            minimum_cash = portfolio_value * self.minimum_reserve_pct / 100.0
+            optimal_cash = portfolio_value * self.optimal_reserve_pct / 100.0
+            emergency = bool(daily["daily_loss_halt"] or current_reserve_pct < self.emergency_threshold_pct)
+
             return {
-                'status': status,
-                'current_cash': current_cash,
-                'portfolio_value': portfolio_value,
-                'reserve_percentage': current_reserve_pct,
-                'minimum_required': self.minimum_reserve_pct,
-                'optimal_target': self.optimal_reserve_pct,
-                'cash_shortfall': max(0, minimum_cash - current_cash),
-                'cash_to_optimal': max(0, optimal_cash - current_cash),
-                'trading_permitted': current_reserve_pct >= self.minimum_reserve_pct,
-                'emergency_status': current_reserve_pct < self.emergency_threshold_pct,
-                'max_trade_size': max(0, current_cash - minimum_cash),
-                'recommendations': self._get_cash_recommendations(current_reserve_pct)
+                "status": status,
+                "current_cash": current_cash,
+                "portfolio_value": portfolio_value,
+                "reserve_percentage": current_reserve_pct,
+                "minimum_required": self.minimum_reserve_pct,
+                "optimal_target": self.optimal_reserve_pct,
+                "cash_shortfall": max(0.0, minimum_cash - current_cash),
+                "cash_to_optimal": max(0.0, optimal_cash - current_cash),
+                "trading_permitted": current_reserve_pct >= self.minimum_reserve_pct and not daily["daily_loss_halt"],
+                "emergency_status": emergency,
+                "max_trade_size": max(0.0, current_cash - minimum_cash),
+                "recommendations": self._get_cash_recommendations(current_reserve_pct, daily),
+                **daily,
             }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting cash status: {e}")
-            return {'status': 'ERROR', 'message': str(e)}
-    
+        except Exception as exc:
+            self.logger.error(f"Error getting cash status: {exc}")
+            return {
+                "status": "ERROR",
+                "message": str(exc),
+                "trading_permitted": False,
+                "emergency_status": True,
+                "reserve_percentage": 0.0,
+                "recommendations": ["HALT new trading until safety state can be verified"],
+            }
+
     async def _get_portfolio_value(self) -> float:
-        """Calculate total portfolio value (cash + positions)."""
         try:
-            # Get available cash
             balance_response = await self.kalshi_client.get_balance()
             available_cash = get_balance_dollars(balance_response)
-
             marked_portfolio_value = get_portfolio_value_dollars(balance_response)
             if marked_portfolio_value > 0:
                 return available_cash + marked_portfolio_value
-            
-            # Get current positions value
+
             positions_response = await self.kalshi_client.get_positions()
-            positions = positions_response.get('event_positions', []) if isinstance(positions_response, dict) else []
-            total_position_value = 0
-            
-            for position in positions:
-                if not isinstance(position, dict):
-                    continue
-                total_position_value += get_position_exposure_dollars(position)
-            
-            return available_cash + total_position_value
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating portfolio value: {e}")
-            return 100.0  # Conservative fallback
-    
+            positions = positions_response.get("event_positions", []) if isinstance(positions_response, dict) else []
+            position_value = sum(
+                get_position_exposure_dollars(position)
+                for position in positions
+                if isinstance(position, dict)
+            )
+            return available_cash + position_value
+        except Exception as exc:
+            self.logger.error(f"Error calculating portfolio value: {exc}")
+            raise
+
     async def _get_available_cash(self) -> float:
-        """Get available cash balance."""
-        try:
-            balance_response = await self.kalshi_client.get_balance()
-            return get_balance_dollars(balance_response)
-        except Exception as e:
-            self.logger.error(f"Error getting available cash: {e}")
-            return 0.0
-    
-    def _get_cash_recommendations(self, reserve_pct: float) -> List[str]:
-        """Get recommendations based on cash reserve level."""
-        recommendations = []
-        
+        balance_response = await self.kalshi_client.get_balance()
+        return get_balance_dollars(balance_response)
+
+    def _get_cash_recommendations(self, reserve_pct: float, daily: Optional[Dict[str, Any]] = None) -> List[str]:
+        daily = daily or {}
+        if daily.get("daily_loss_halt"):
+            return ["DAILY LOSS CAP HIT: no new trades until the next UTC trading day"]
         if reserve_pct < self.critical_threshold_pct:
-            recommendations.append("🚨 CRITICAL: Close positions immediately")
-            recommendations.append("🚨 HALT all trading until reserves restored")
-            recommendations.append("🚨 Consider depositing additional funds")
-        elif reserve_pct < self.emergency_threshold_pct:
-            recommendations.append("⚠️ EMERGENCY: Close 2-3 positions immediately")
-            recommendations.append("⚠️ Suspend new trading until above 15%")
-        elif reserve_pct < self.minimum_reserve_pct:
-            recommendations.append("⚠️ Close some positions to build reserves")
-            recommendations.append("⚠️ Avoid new trades until above 15%")
-        elif reserve_pct < self.optimal_reserve_pct:
-            recommendations.append("✅ Reserves adequate but could be improved")
-            recommendations.append("✅ Consider building toward 20% optimal")
-        else:
-            recommendations.append("🎯 Excellent cash position")
-            recommendations.append("🎯 Ready for opportunistic trades")
-        
-        return recommendations
+            return ["CRITICAL: halt new trading", "Restore protected cash before resuming"]
+        if reserve_pct < self.emergency_threshold_pct:
+            return ["EMERGENCY: suspend new trading", "Restore protected cash"]
+        if reserve_pct < self.minimum_reserve_pct:
+            return [f"Protected reserve below {self.minimum_reserve_pct:.1f}%", "No new positions"]
+        if reserve_pct < self.optimal_reserve_pct:
+            return ["Reserve is protected; keep sizing conservative"]
+        return ["Protected reserve healthy", "Trading permitted within position limits"]
 
 
-# Convenience functions for easy integration
 async def check_can_trade_with_cash_reserves(
     trade_value: float,
     db_manager: DatabaseManager,
-    kalshi_client: KalshiClient
+    kalshi_client: KalshiClient,
 ) -> Tuple[bool, str]:
-    """Simple check if a trade can be made within cash reserve requirements."""
     manager = CashReservesManager(db_manager, kalshi_client)
     result = await manager.check_cash_reserves(trade_value)
     return result.can_trade, result.reason
@@ -357,19 +384,17 @@ async def check_can_trade_with_cash_reserves(
 
 async def get_max_trade_size_for_reserves(
     db_manager: DatabaseManager,
-    kalshi_client: KalshiClient
+    kalshi_client: KalshiClient,
 ) -> float:
-    """Get maximum trade size that maintains cash reserves."""
     manager = CashReservesManager(db_manager, kalshi_client)
     status = await manager.get_cash_status()
-    return status.get('max_trade_size', 0.0)
+    return float(status.get("max_trade_size", 0.0))
 
 
 async def is_cash_emergency(
     db_manager: DatabaseManager,
-    kalshi_client: KalshiClient
+    kalshi_client: KalshiClient,
 ) -> bool:
-    """Check if we're in a cash emergency situation."""
     manager = CashReservesManager(db_manager, kalshi_client)
     status = await manager.get_cash_status()
-    return status.get('emergency_status', False) 
+    return bool(status.get("emergency_status", True))
