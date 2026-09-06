@@ -1,5 +1,5 @@
 """
-Cash reserve, daily-loss, and drawdown safety brakes for the trading system.
+Cash reserve, daily-loss, drawdown, and position-limit safety brakes for the trading system.
 
 Defaults are intentionally conservative and can be adjusted with environment
 variables. The reserve is treated as untouchable capital for new trades.
@@ -13,6 +13,8 @@ Environment variables:
 - DAILY_LOSS_CAP_PCT (default: 3.0)
 - DAILY_LOSS_CAP_DOLLARS (default: 0; disabled when 0)
 - MAX_DRAWDOWN_PCT (default: 15.0; enforced by DrawdownGuard)
+- MAX_OPEN_POSITIONS (default: 15; enforced by PositionLimitsManager)
+- MAX_POSITION_SIZE_PCT (default: 5.0; enforced by PositionLimitsManager)
 """
 
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ from src.utils.kalshi_normalization import (
     get_position_exposure_dollars,
 )
 from src.utils.logging_setup import get_trading_logger
+from src.utils.position_limits import PositionLimitsManager
 
 
 def _env_float(name: str, default: float) -> float:
@@ -62,20 +65,18 @@ class CashEmergencyAction:
 
 
 class CashReservesManager:
-    """Central safety manager for protected cash, daily loss, and drawdown limits."""
+    """Central safety manager for reserve, loss, drawdown, and position limits."""
 
     def __init__(self, db_manager: DatabaseManager, kalshi_client: KalshiClient):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
         self.logger = get_trading_logger("cash_reserves")
 
-        # Protected capital. Defaults to roughly one-third of the portfolio.
         self.minimum_reserve_pct = _env_float("MIN_CASH_RESERVE_PCT", 33.0)
         self.optimal_reserve_pct = _env_float("OPTIMAL_CASH_RESERVE_PCT", 40.0)
         self.emergency_threshold_pct = _env_float("EMERGENCY_CASH_RESERVE_PCT", 25.0)
         self.critical_threshold_pct = _env_float("CRITICAL_CASH_RESERVE_PCT", 15.0)
 
-        # Trade and session brakes.
         self.max_single_trade_impact = _env_float("MAX_SINGLE_TRADE_IMPACT_PCT", 5.0)
         self.buffer_for_opportunities = _env_float("CASH_OPPORTUNITY_BUFFER_PCT", 2.0)
         self.daily_loss_cap_pct = max(0.0, _env_float("DAILY_LOSS_CAP_PCT", 3.0))
@@ -106,7 +107,6 @@ class CashReservesManager:
                 row = await cursor.fetchone()
                 return float(row[0] or 0.0) if row else 0.0
         except Exception as exc:
-            # Fail safe: an unreadable P&L ledger should not silently disable safety.
             self.logger.error(f"Unable to read daily realized P&L: {exc}")
             raise
 
@@ -138,11 +138,18 @@ class CashReservesManager:
             reserve_after_trade = (cash_after_trade / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             daily = await self._daily_loss_status(portfolio_value)
             drawdown = await check_drawdown_guard(self.db_manager, self.kalshi_client)
+            position_limits = await PositionLimitsManager(
+                self.db_manager,
+                self.kalshi_client,
+            ).check_position_limits(
+                proposed_position_size=proposed_trade_value,
+                portfolio_value=portfolio_value,
+            )
 
             recommendations: List[str] = []
             can_trade = True
             emergency_status = False
-            reason = "Cash reserves, daily loss, and drawdown limits are adequate"
+            reason = "Capital safety checks passed"
 
             if not drawdown.can_trade:
                 can_trade = False
@@ -190,6 +197,10 @@ class CashReservesManager:
                     f"minimum {self.minimum_reserve_pct:.1f}%"
                 )
                 recommendations.append("No new positions until protected reserve is restored")
+            elif not position_limits.can_trade:
+                can_trade = False
+                reason = f"POSITION LIMIT HALT: {position_limits.reason}"
+                recommendations.extend(position_limits.recommended_actions)
 
             trade_impact_pct = (proposed_trade_value / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             if trade_impact_pct > self.max_single_trade_impact + 0.01:
@@ -275,7 +286,6 @@ class CashReservesManager:
             positions_to_close = 0
             expected_cash_freed = 0.0
             if positions and cash_shortfall > 0:
-                # Estimate only; actual exit execution remains the responsibility of the execution layer.
                 avg_position_value = sum(
                     max(0.0, float(getattr(p, "entry_price", 0.0)) * float(getattr(p, "quantity", 0.0)))
                     for p in positions
