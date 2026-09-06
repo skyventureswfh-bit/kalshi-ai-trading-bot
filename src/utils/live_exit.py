@@ -43,6 +43,12 @@ async def execute_confirmed_live_exit(
     A risk exit should never create a new position, so this uses reduce_only.
     Fill-or-kill avoids leaving a tracker-generated emergency exit resting while
     local state incorrectly assumes the exposure is gone.
+
+    Exchange status text alone is not enough to close local state. Some order
+    payloads can report a terminal status without carrying an explicit filled
+    count. We therefore require the reported filled quantity to cover the full
+    requested quantity; missing or partial fill data fails closed and leaves the
+    local position open for reconciliation.
     """
     logger = get_trading_logger("confirmed_live_exit")
     side = str(position.side or "").lower()
@@ -85,11 +91,14 @@ async def execute_confirmed_live_exit(
     order_info = response.get("order", {}) if isinstance(response, dict) else {}
     status = str(order_info.get("status", "")).lower()
     filled_quantity = float(get_order_fill_count(order_info) or 0.0)
-    filled = status in {"filled", "executed", "completed"} or filled_quantity >= quantity - 1e-9
+
+    # Never infer a full monetary exit from a status word alone. The quantity is
+    # the proof that the requested exposure actually left the account.
+    filled = filled_quantity >= quantity - 1e-9
 
     if not filled:
         logger.warning(
-            "Live exit not confirmed filled",
+            "Live exit not confirmed fully filled",
             ticker=position.market_id,
             side=position.side,
             status=status or "unknown",
@@ -102,7 +111,7 @@ async def execute_confirmed_live_exit(
             0.0,
             order_info.get("order_id") or client_order_id,
             status or "unknown",
-            "exchange did not confirm full exit fill",
+            "exchange did not report the full requested exit quantity as filled",
             order_info,
         )
 
@@ -111,7 +120,7 @@ async def execute_confirmed_live_exit(
     )
     return LiveExitResult(
         True,
-        quantity if filled_quantity <= 0 else filled_quantity,
+        filled_quantity,
         fill_price,
         order_info.get("order_id") or client_order_id,
         status or "filled",
