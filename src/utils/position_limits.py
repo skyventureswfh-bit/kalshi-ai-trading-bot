@@ -179,35 +179,61 @@ class PositionLimitsManager:
             )
 
     async def enforce_position_limits(self, force_closure: bool = False) -> Dict[str, Any]:
-        """Reduce locally tracked open-position count when limits are exceeded.
+        """Identify positions that must be reduced without falsifying local state.
 
-        Note: this method preserves the repository's existing behavior and marks
-        selected local positions closed. Exchange-side order/position exit logic
-        remains the responsibility of the execution layer.
+        This manager is a risk selector, not an exchange execution engine. The
+        previous implementation marked selected positions ``closed`` in SQLite
+        without placing or confirming a Kalshi sell. That could make the bot
+        believe exposure was gone while real money remained at risk.
+
+        The method now returns prioritized exit candidates and leaves every
+        position open until the execution layer confirms an actual exchange
+        exit. New entries remain blocked by ``check_position_limits`` while the
+        account is over the configured limits.
         """
         try:
             current_positions = await self._get_position_count()
             target = self.warning_threshold if force_closure else self.max_positions
-            positions_to_close = max(0, current_positions - target)
-            if positions_to_close == 0:
+            positions_to_reduce = max(0, current_positions - target)
+            if positions_to_reduce == 0:
                 return {
                     "action": "no_action_needed",
                     "current_positions": current_positions,
                     "message": "Position count within limits",
                 }
 
-            candidates = await self._get_positions_for_closure(positions_to_close)
-            closed: List[str] = []
-            for candidate in candidates:
-                if await self._close_position(candidate):
-                    closed.append(candidate.market_id)
+            candidates = await self._get_positions_for_closure(positions_to_reduce)
+            candidate_payload = [
+                {
+                    "position_id": candidate.position_id,
+                    "market_id": candidate.market_id,
+                    "side": candidate.side,
+                    "priority_score": candidate.priority_score,
+                    "confidence": candidate.confidence,
+                    "age_hours": candidate.age_hours,
+                }
+                for candidate in candidates
+            ]
+
+            self.logger.warning(
+                "Position limits require confirmed exchange exits before local closure",
+                current_positions=current_positions,
+                target_positions=target,
+                positions_to_reduce=positions_to_reduce,
+                candidates=[candidate.market_id for candidate in candidates],
+            )
 
             return {
-                "action": "positions_closed" if closed else "no_positions_closed",
-                "positions_closed": len(closed),
-                "closed_markets": closed,
-                "remaining_positions": current_positions - len(closed),
-                "message": f"Closed {len(closed)} locally tracked position(s) to enforce limits",
+                "action": "exit_required",
+                "current_positions": current_positions,
+                "target_positions": target,
+                "positions_to_reduce": positions_to_reduce,
+                "exit_candidates": candidate_payload,
+                "remaining_positions": current_positions,
+                "message": (
+                    "No local positions were marked closed. Route exit candidates through "
+                    "the confirmed exchange-exit path, then close local state only after fill confirmation."
+                ),
             }
         except Exception as exc:
             self.logger.error(f"Error enforcing position limits: {exc}")
@@ -325,17 +351,6 @@ class PositionLimitsManager:
             priority += 2.0
         return priority
 
-    async def _close_position(self, candidate: PositionToClose) -> bool:
-        try:
-            await self.db_manager.update_position_status(candidate.position_id, "closed")
-            self.logger.info(
-                f"Position {candidate.market_id} marked closed by position-limit enforcement"
-            )
-            return True
-        except Exception as exc:
-            self.logger.error(f"Error closing position {candidate.market_id}: {exc}")
-            return False
-
     def _get_status_recommendations(self, positions: int, usage: float) -> List[str]:
         recommendations: List[str] = []
         if positions >= self.emergency_position_limit:
@@ -377,8 +392,8 @@ async def enforce_limits_if_needed(
     current_count = await manager._get_position_count()
     if current_count > manager.max_positions:
         result = await manager.enforce_position_limits()
-        return result.get("action") == "positions_closed"
-    return False
+        return result.get("action") == "no_action_needed"
+    return True
 
 
 async def get_max_position_size(
