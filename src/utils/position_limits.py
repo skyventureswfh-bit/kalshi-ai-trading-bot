@@ -16,12 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import os
 
 from src.clients.kalshi_client import KalshiClient
+from src.utils.account_snapshot import AccountSafetySnapshot, get_account_safety_snapshot
 from src.utils.database import DatabaseManager, Position
-from src.utils.kalshi_normalization import (
-    get_balance_dollars,
-    get_portfolio_value_dollars,
-    get_position_exposure_dollars,
-)
 from src.utils.logging_setup import get_trading_logger
 
 
@@ -87,16 +83,26 @@ class PositionLimitsManager:
         self,
         proposed_position_size: float,
         portfolio_value: Optional[float] = None,
+        available_cash: Optional[float] = None,
+        snapshot: Optional[AccountSafetySnapshot] = None,
     ) -> PositionLimitResult:
         try:
             proposed_position_size = max(0.0, float(proposed_position_size))
-            if portfolio_value is None:
-                portfolio_value = await self._get_portfolio_value()
+            if snapshot is None and (portfolio_value is None or available_cash is None):
+                snapshot = await get_account_safety_snapshot(self.kalshi_client)
+            if snapshot is not None:
+                portfolio_value = snapshot.portfolio_value
+                available_cash = snapshot.available_cash
+            if portfolio_value is None or available_cash is None:
+                raise ValueError("portfolio safety snapshot is incomplete")
             if portfolio_value <= 0:
                 raise ValueError("portfolio value must be positive")
 
             current_positions = await self._get_position_count()
-            current_usage = await self._calculate_portfolio_usage(portfolio_value)
+            current_usage = self._calculate_portfolio_usage_from_snapshot(
+                portfolio_value,
+                available_cash,
+            )
             proposed_position_pct = proposed_position_size / portfolio_value * 100.0
             max_position_size = portfolio_value * self.max_position_size_pct / 100.0
             projected_usage = current_usage + proposed_position_pct
@@ -141,7 +147,6 @@ class PositionLimitsManager:
                     f"Keep {self.min_cash_reserve_pct:.1f}% of portfolio protected as cash"
                 )
 
-            available_cash = await self._get_available_cash()
             cash_after_trade = available_cash - proposed_position_size
             minimum_cash = portfolio_value * self.min_cash_reserve_pct / 100.0
             if cash_after_trade < minimum_cash - 1e-9:
@@ -242,9 +247,13 @@ class PositionLimitsManager:
     async def get_position_limits_status(self) -> Dict[str, Any]:
         try:
             current_positions = await self._get_position_count()
-            portfolio_value = await self._get_portfolio_value()
-            portfolio_usage = await self._calculate_portfolio_usage(portfolio_value)
-            available_cash = await self._get_available_cash()
+            snapshot = await get_account_safety_snapshot(self.kalshi_client)
+            portfolio_value = snapshot.portfolio_value
+            available_cash = snapshot.available_cash
+            portfolio_usage = self._calculate_portfolio_usage_from_snapshot(
+                portfolio_value,
+                available_cash,
+            )
 
             if current_positions >= self.emergency_position_limit:
                 status = "EMERGENCY"
@@ -284,31 +293,29 @@ class PositionLimitsManager:
         return len(positions)
 
     async def _get_portfolio_value(self) -> float:
-        balance = await self.kalshi_client.get_balance()
-        available_cash = get_balance_dollars(balance)
-        marked_value = get_portfolio_value_dollars(balance)
-        if marked_value > 0:
-            return available_cash + marked_value
-
-        positions_response = await self.kalshi_client.get_positions()
-        positions = positions_response.get("event_positions", []) if isinstance(positions_response, dict) else []
-        position_value = sum(
-            get_position_exposure_dollars(position)
-            for position in positions
-            if isinstance(position, dict)
-        )
-        return available_cash + position_value
+        return (await get_account_safety_snapshot(self.kalshi_client)).portfolio_value
 
     async def _get_available_cash(self) -> float:
-        balance = await self.kalshi_client.get_balance()
-        return get_balance_dollars(balance)
+        return (await get_account_safety_snapshot(self.kalshi_client)).available_cash
 
-    async def _calculate_portfolio_usage(self, portfolio_value: float) -> float:
+    @staticmethod
+    def _calculate_portfolio_usage_from_snapshot(
+        portfolio_value: float,
+        available_cash: float,
+    ) -> float:
         if portfolio_value <= 0:
             return 0.0
-        available_cash = await self._get_available_cash()
         used_capital = max(0.0, portfolio_value - available_cash)
         return used_capital / portfolio_value * 100.0
+
+    async def _calculate_portfolio_usage(
+        self,
+        portfolio_value: float,
+        available_cash: Optional[float] = None,
+    ) -> float:
+        if available_cash is None:
+            available_cash = (await get_account_safety_snapshot(self.kalshi_client)).available_cash
+        return self._calculate_portfolio_usage_from_snapshot(portfolio_value, available_cash)
 
     async def _get_positions_for_closure(self, count: int) -> List[PositionToClose]:
         positions = await self.db_manager.get_open_positions()
