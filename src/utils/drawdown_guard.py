@@ -13,18 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Any
+from typing import Optional
 
 import aiosqlite
 
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
+from src.utils.account_snapshot import AccountSafetySnapshot, get_account_safety_snapshot
 from src.utils.database import DatabaseManager
-from src.utils.kalshi_normalization import (
-    get_balance_dollars,
-    get_portfolio_value_dollars,
-    get_position_exposure_dollars,
-)
 from src.utils.logging_setup import get_trading_logger
 
 
@@ -54,11 +50,13 @@ class DrawdownGuard:
         self.limit_pct = max(0.0, _env_float("MAX_DRAWDOWN_PCT", 15.0))
         self.logger = get_trading_logger("drawdown_guard")
 
-    async def check(self) -> DrawdownStatus:
+    async def check(
+        self,
+        snapshot: Optional[AccountSafetySnapshot] = None,
+    ) -> DrawdownStatus:
         try:
-            current_value = await self._get_portfolio_value()
-            if current_value <= 0:
-                raise ValueError("portfolio value is zero or negative")
+            snapshot = snapshot or await get_account_safety_snapshot(self.kalshi_client)
+            current_value = snapshot.portfolio_value
 
             live_mode = 1 if bool(getattr(settings.trading, "live_trading_enabled", False)) else 0
             async with aiosqlite.connect(self.db_manager.db_path) as db:
@@ -124,26 +122,11 @@ class DrawdownGuard:
                 reason=f"Drawdown safety failed closed: {exc}",
             )
 
-    async def _get_portfolio_value(self) -> float:
-        balance_response = await self.kalshi_client.get_balance()
-        available_cash = get_balance_dollars(balance_response)
-        marked_portfolio_value = get_portfolio_value_dollars(balance_response)
-        if marked_portfolio_value > 0:
-            return available_cash + marked_portfolio_value
-
-        positions_response = await self.kalshi_client.get_positions()
-        positions = positions_response.get("event_positions", []) if isinstance(positions_response, dict) else []
-        position_value = sum(
-            get_position_exposure_dollars(position)
-            for position in positions
-            if isinstance(position, dict)
-        )
-        return available_cash + position_value
-
 
 async def check_drawdown_guard(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
+    snapshot: Optional[AccountSafetySnapshot] = None,
 ) -> DrawdownStatus:
     """Convenience wrapper used by execution/risk gates."""
-    return await DrawdownGuard(db_manager, kalshi_client).check()
+    return await DrawdownGuard(db_manager, kalshi_client).check(snapshot=snapshot)
