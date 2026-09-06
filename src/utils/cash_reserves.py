@@ -128,8 +128,22 @@ class CashReservesManager:
     ) -> CashReserveResult:
         try:
             snapshot = snapshot or await get_account_safety_snapshot(self.kalshi_client)
-            if portfolio_value is None:
-                portfolio_value = snapshot.portfolio_value
+
+            # One safety decision must use one equity number. Older callers may
+            # still pass ``portfolio_value`` explicitly, so accept it only when
+            # it agrees with the shared account snapshot. Mixing a caller value
+            # for reserve math with snapshot cash/position data can make the same
+            # trade look safe in one brake and unsafe in another.
+            if portfolio_value is not None:
+                supplied_value = float(portfolio_value)
+                tolerance = max(0.01, abs(snapshot.portfolio_value) * 0.001)
+                if abs(supplied_value - snapshot.portfolio_value) > tolerance:
+                    raise ValueError(
+                        "portfolio_value conflicts with shared account snapshot "
+                        f"({supplied_value:.2f} vs {snapshot.portfolio_value:.2f})"
+                    )
+            portfolio_value = snapshot.portfolio_value
+
             current_cash = snapshot.available_cash
             current_reserve_pct = (current_cash / portfolio_value) * 100 if portfolio_value > 0 else 0.0
             cash_after_trade = current_cash - proposed_trade_value
