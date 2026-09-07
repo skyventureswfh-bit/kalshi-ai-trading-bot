@@ -791,7 +791,7 @@ def _normalize_sports_label(value: Any) -> str:
 def _looks_like_spread_or_total(label: str) -> bool:
     """
     True when a normalized market label looks like a spread/total/score market
-    rather than a plain game-winner — those must not receive a moneyline win
+    rather than a plain game-winner â€” those must not receive a moneyline win
     probability. Conservative (any numeric token or wagering keyword skips).
     """
     tokens = label.split()
@@ -1107,7 +1107,7 @@ class LiveTradeDecisionLoop:
         EV gate, so an overconfident strategy automatically trades less.
 
         When ``market_type`` is provided and that category has accumulated
-        enough settled samples, the category-specific slope is used —
+        enough settled samples, the category-specific slope is used â€”
         categories where the models are systematically overconfident (e.g.
         economics) shrink harder than ones where they are sharp.
         """
@@ -1169,7 +1169,7 @@ class LiveTradeDecisionLoop:
         refines each role's global multiplier via hierarchical shrinkage,
         so "sharp on weather, dull on sports" shows up in the weights
         instead of averaging away. Roles without enough settled
-        observations (or when skill weighting is disabled) get no entry —
+        observations (or when skill weighting is disabled) get no entry â€”
         pooling treats a missing role as multiplier 1.0, so this fails
         open to the configured base weights.
         """
@@ -1219,7 +1219,7 @@ class LiveTradeDecisionLoop:
         """
         Pull deterministic per-bucket weather probabilities out of a research
         payload so the EV gate can pool them with the LLM estimate later in
-        the same run (and shortly after — entries expire in 30 minutes).
+        the same run (and shortly after â€” entries expire in 30 minutes).
         """
         try:
             weather_context = payload.get("weather_context") or {}
@@ -1235,7 +1235,7 @@ class LiveTradeDecisionLoop:
                 if not (0.0 <= model_prob <= 1.0):
                     continue
                 self._weather_model_probs[str(ticker)] = {**entry, "cached_at": now}
-        except Exception as exc:  # telemetry only — never break the loop
+        except Exception as exc:  # telemetry only â€” never break the loop
             self.logger.debug("Weather probability harvest failed", error=str(exc))
 
     def _weather_model_entry(
@@ -1313,7 +1313,7 @@ class LiveTradeDecisionLoop:
                     "matched_side": side_name,
                     "cached_at": now,
                 }
-        except Exception as exc:  # telemetry only — never break the loop
+        except Exception as exc:  # telemetry only â€” never break the loop
             self.logger.debug("Sports probability harvest failed", error=str(exc))
 
     def _sports_model_entry(
@@ -1381,7 +1381,7 @@ class LiveTradeDecisionLoop:
                     "volume_usd": volume,
                     "cached_at": now,
                 }
-        except Exception as exc:  # telemetry only — never break the loop
+        except Exception as exc:  # telemetry only â€” never break the loop
             self.logger.debug("Cross-market probability harvest failed", error=str(exc))
 
     def _cross_market_entry(
@@ -1841,7 +1841,7 @@ class LiveTradeDecisionLoop:
                 "The weather_context contains deterministic ensemble-forecast bucket "
                 "probabilities (model_yes_probability per ticker) computed from "
                 "GFS/ECMWF ensemble members recentered toward the official NWS point "
-                "forecast. Anchor your fair_yes_probability on them — deviate only "
+                "forecast. Anchor your fair_yes_probability on them â€” deviate only "
                 "with concrete evidence the model missed (e.g. a frontal timing shift "
                 "in the latest discussion), and say why.\n"
             )
@@ -1849,7 +1849,7 @@ class LiveTradeDecisionLoop:
             weather_prompt_line += (
                 "The sports_context.signals.odds block carries DE-VIGGED sportsbook "
                 "implied win probabilities (home_implied_win_probability / "
-                "away_implied_win_probability) — the sharpest public consensus for "
+                "away_implied_win_probability) â€” the sharpest public consensus for "
                 "game-winner markets. Treat them as the prior and anchor "
                 "fair_yes_probability to the matching team's number; stray only with "
                 "concrete in-game evidence the book may lag, and say why.\n"
@@ -1857,11 +1857,11 @@ class LiveTradeDecisionLoop:
         prompt = (
             f"You are the {specialist_label} for a short-dated prediction-market bot.\n"
             f"Review the event packet and decide whether there is an actionable {_resolve_quick_flip_runtime_label()} trade right now.\n"
-            "Estimate fair_yes_probability — your TRUE probability that the market resolves YES — "
+            "Estimate fair_yes_probability â€” your TRUE probability that the market resolves YES â€” "
             "independent of the current price, anchored in the evidence in the packet.\n"
             f"{weather_prompt_line}"
             "The market price is usually close to fair: if your estimate is within ~5 cents of the "
-            "midpoint, there is no edge — use WATCH or SKIP.\n"
+            "midpoint, there is no edge â€” use WATCH or SKIP.\n"
             "Kalshi taker fees are about 0.07 x P x (1-P) per contract (~1.75c at mid prices); "
             "your edge must clearly exceed fees after entry at the ask.\n"
             "Trade only when liquidity, catalyst, and edge are all present. Use QUICK_FLIP only for sub-30-minute holds.\n"
@@ -2285,7 +2285,7 @@ class LiveTradeDecisionLoop:
                     final_intent=final_intent,
                     status="blocked",
                     summary=(
-                        f"Weather contract resolves {lead_days:.0f} days out — beyond "
+                        f"Weather contract resolves {lead_days:.0f} days out â€” beyond "
                         f"the {max_lead:.0f}-day forecast-skill horizon."
                     ),
                     error="weather_lead_too_far",
@@ -2338,7 +2338,7 @@ class LiveTradeDecisionLoop:
 
         # ------------------------------------------------------------------
         # Sportsbook override: de-vigged moneyline implied win probabilities
-        # are the sharpest public prior for game-winner markets — and sports
+        # are the sharpest public prior for game-winner markets â€” and sports
         # (NCAAB) is the bot's only proven-profitable niche. When a fresh,
         # unambiguous per-team odds estimate exists for this ticker it is
         # pooled into the LLM estimate (log-odds, weight scaled by quality),
@@ -2495,7 +2495,7 @@ class LiveTradeDecisionLoop:
         top_depth_contracts: Optional[float] = None
         if min_top_depth > 0:
             # Depth is enforced identically in paper and live (shadow parity);
-            # a failed orderbook *fetch* skips the check in both modes — the
+            # a failed orderbook *fetch* skips the check in both modes â€” the
             # spread guard and EV gate still bound the damage, and blocking on
             # telemetry hiccups would make paper/live decisions diverge.
             try:
@@ -2553,7 +2553,7 @@ class LiveTradeDecisionLoop:
 
         # Market-prior calibration: when validated models exist (fit from
         # settled snapshot history), the gate's market anchor uses the
-        # calibrated settlement probability instead of the raw mid —
+        # calibrated settlement probability instead of the raw mid â€”
         # correcting systematic price biases such as favorite-longshot.
         # Fails closed to the raw mid (identity) when no model is active.
         market_yes_prior = market_yes_mid
@@ -2640,7 +2640,7 @@ class LiveTradeDecisionLoop:
             disagreement=intent_disagreement,
         )
         gate_snapshot = {
-            # Recorded as the calibration training label — deliberately the
+            # Recorded as the calibration training label â€” deliberately the
             # PRE-meta-model pooled value (see above).
             "fair_yes_probability": pre_meta_fair_yes_for_gate,
             "meta_adjusted_fair_yes_probability": gate_fair_yes,
@@ -2730,7 +2730,7 @@ class LiveTradeDecisionLoop:
                     status="blocked",
                     summary=(
                         "Kelly sizing allows less than one contract at the "
-                        "gate's blended win probability — the measured edge "
+                        "gate's blended win probability â€” the measured edge "
                         "does not support a position."
                     ),
                     error="kelly_zero_size",
@@ -2923,7 +2923,7 @@ class LiveTradeDecisionLoop:
         )
         await self._persist_runtime_state(
             run_id=run_id,
-            loop_status="error" if status == "error" else "completed",
+            loop_status="completed",
             step="execution",
             step_status=status,
             summary=summary,
