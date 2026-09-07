@@ -47,6 +47,31 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
+function resolvePythonCommand() {
+  const configured = (process.env.PYTHON || "").trim();
+  if (configured) {
+    return configured;
+  }
+
+  const candidates =
+    process.platform === "win32"
+      ? [
+          path.join(repoRoot, ".venv", "Scripts", "python.exe"),
+          path.join(path.dirname(repoRoot), ".venv", "Scripts", "python.exe")
+        ]
+      : [
+          path.join(repoRoot, ".venv", "bin", "python"),
+          path.join(path.dirname(repoRoot), ".venv", "bin", "python")
+        ];
+
+  const localPython = candidates.find((candidate) => fs.existsSync(candidate));
+  if (localPython) {
+    return localPython;
+  }
+
+  return process.platform === "win32" ? "python" : "python3";
+}
+
 function normalizeChildTempEnv(env) {
   if (process.platform === "win32") {
     return env;
@@ -266,9 +291,12 @@ async function main() {
     process.env.ANALYSIS_BRIDGE_URL || localBridgeUrl;
   const dashboardDbPath =
     process.env.DB_PATH || path.join(repoRoot, "trading_system.db");
+  const pythonCommand = resolvePythonCommand();
+
+  console.log(`Dashboard Python: ${pythonCommand}`);
 
   const bridgeCommand = [
-    "python",
+    shellQuote(pythonCommand),
     "-m",
     "uvicorn",
     "python_bridge.app.main:app",
