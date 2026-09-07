@@ -1,31 +1,18 @@
 """
 Python-side crypto data adapter for the live-trade agent loop.
 
-Complements the BTC compatibility helper in ``src/data/live_trade_research.py``
-by pulling:
+Primary sources:
+- CoinGecko spot price + 24h context.
+- CoinGecko 1-day market chart.
+- Binance public futures funding rate.
 
-- CoinGecko spot price + 24h change + 24h volume for BTC, ETH, SOL, XRP, and DOGE.
-- CoinGecko ``market_chart`` 1-day history downsampled to 1m/5m bars so
-  agents see short-horizon momentum.
-- Binance public futures funding rate (``fapi.binance.com``) for
-  BTCUSDT perpetual — no API key required, low rate limit.
+Fallback sources:
+- Coinbase Exchange public ticker for spot price.
+- Coinbase Exchange public candles for 5-minute bars.
 
-No paid providers. Public endpoints only. All network calls use the
-shared ``httpx.AsyncClient`` if one is passed in; otherwise a
-local one is created with the same 3-second timeout used by the rest
-of the live-trade stack.
-
-Public surface::
-
-    from src.data.crypto_adapter import CryptoAdapter, fetch_context
-
-    async def fetch_context(market: dict) -> dict
-
-returning the normalized adapter payload described in
-``docs/data_adapters/README.md``.
-
-``live_trade_research.py`` owns this adapter in production and injects its
-payload into crypto-focused research bundles.
+Funding is useful enrichment, but a geographically blocked futures endpoint
+must not invalidate otherwise healthy spot + chart pricing. The adapter still
+fails closed when primary pricing itself is unavailable.
 """
 
 from __future__ import annotations
@@ -40,40 +27,42 @@ import httpx
 
 from src.utils.logging_setup import TradingLoggerMixin
 
-SOURCE_NAME = "coingecko+binance.futures"
+SOURCE_NAME = "coingecko+coinbase+binance.futures"
 CATEGORY = "crypto"
 DEFAULT_TIMEOUT_SECONDS = 3.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF = 0.25
-DEFAULT_CACHE_TTL = 20.0  # seconds
+DEFAULT_CACHE_TTL = 20.0
 
-# Kalshi ticker roots → (coingecko_id, binance_symbol). Funding rate is only
-# available from Binance futures for the first two today; CoinGecko lookups
-# work for everything.
 ASSET_REGISTRY: Dict[str, Dict[str, str]] = {
     "BTC": {
         "coingecko_id": "bitcoin",
         "binance_symbol": "BTCUSDT",
+        "coinbase_product": "BTC-USD",
         "display_name": "Bitcoin",
     },
     "ETH": {
         "coingecko_id": "ethereum",
         "binance_symbol": "ETHUSDT",
+        "coinbase_product": "ETH-USD",
         "display_name": "Ethereum",
     },
     "SOL": {
         "coingecko_id": "solana",
         "binance_symbol": "SOLUSDT",
+        "coinbase_product": "SOL-USD",
         "display_name": "Solana",
     },
     "XRP": {
         "coingecko_id": "ripple",
         "binance_symbol": "XRPUSDT",
+        "coinbase_product": "XRP-USD",
         "display_name": "XRP",
     },
     "DOGE": {
         "coingecko_id": "dogecoin",
         "binance_symbol": "DOGEUSDT",
+        "coinbase_product": "DOGE-USD",
         "display_name": "Dogecoin",
     },
 }
@@ -92,9 +81,10 @@ def _iso_utc(now: Optional[datetime] = None) -> str:
 
 
 class CryptoAdapter(TradingLoggerMixin):
-    """CoinGecko + Binance-futures enrichment for crypto Kalshi markets."""
+    """Resilient crypto enrichment for Kalshi live-trade research."""
 
     COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+    COINBASE_BASE = "https://api.exchange.coinbase.com"
     BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 
     def __init__(
@@ -123,9 +113,6 @@ class CryptoAdapter(TradingLoggerMixin):
         if self._owns_client:
             await self.http_client.aclose()
 
-    # ------------------------------------------------------------------ #
-# Public adapter contract
-    # ------------------------------------------------------------------ #
     async def fetch_context(self, market: Mapping[str, Any]) -> Dict[str, Any]:
         start = time.monotonic()
         payload: Dict[str, Any] = {
@@ -144,52 +131,69 @@ class CryptoAdapter(TradingLoggerMixin):
             return payload
 
         registry = ASSET_REGISTRY[symbol]
-        spot_task = self._spot(registry["coingecko_id"])
-        chart_task = self._bars(registry["coingecko_id"])
+        spot_task = self._spot_with_fallback(
+            registry["coingecko_id"], registry["coinbase_product"]
+        )
+        chart_task = self._bars_with_fallback(
+            registry["coingecko_id"], registry["coinbase_product"]
+        )
         funding_task = self._funding(registry["binance_symbol"])
 
-        results = await asyncio.gather(
+        spot_result, chart_result, funding_result = await asyncio.gather(
             spot_task, chart_task, funding_task, return_exceptions=True
         )
-        spot_result, chart_result, funding_result = results
 
         signals: Dict[str, Any] = {
             "asset": symbol,
             "display_name": registry["display_name"],
         }
-        errors: List[str] = []
+        pricing_errors: List[str] = []
+        warnings: List[str] = []
 
         if isinstance(spot_result, Exception):
-            self.logger.warning("crypto spot fetch failed", asset=symbol, error=str(spot_result))
-            errors.append(f"spot:{spot_result.__class__.__name__}")
+            self.logger.warning(
+                "crypto spot fetch failed", asset=symbol, error=str(spot_result)
+            )
+            pricing_errors.append(f"spot:{spot_result.__class__.__name__}")
         else:
             signals["spot"] = spot_result
 
         if isinstance(chart_result, Exception):
-            self.logger.warning("crypto chart fetch failed", asset=symbol, error=str(chart_result))
-            errors.append(f"bars:{chart_result.__class__.__name__}")
+            self.logger.warning(
+                "crypto chart fetch failed", asset=symbol, error=str(chart_result)
+            )
+            pricing_errors.append(f"bars:{chart_result.__class__.__name__}")
         else:
             signals["bars_1m"] = chart_result.get("bars_1m", [])
             signals["bars_5m"] = chart_result.get("bars_5m", [])
 
         if isinstance(funding_result, Exception):
-            self.logger.warning("crypto funding fetch failed", asset=symbol, error=str(funding_result))
-            errors.append(f"funding:{funding_result.__class__.__name__}")
+            self.logger.warning(
+                "crypto funding fetch failed", asset=symbol, error=str(funding_result)
+            )
+            warnings.append(f"funding:{funding_result.__class__.__name__}")
+            signals["funding"] = {
+                "symbol": registry["binance_symbol"],
+                "available": False,
+            }
         else:
+            funding_result = dict(funding_result)
+            funding_result["available"] = True
             signals["funding"] = funding_result
 
+        if warnings:
+            signals["warnings"] = warnings
+
         payload["signals"] = signals
-        if errors:
-            payload["error"] = ";".join(errors)
+        # Spot and bars are the pricing-critical inputs. Funding is optional
+        # enrichment and must not turn healthy price context into a hard error.
+        if pricing_errors:
+            payload["error"] = ";".join(pricing_errors)
         payload["freshness_seconds"] = int(time.monotonic() - start)
         return payload
 
-    # ------------------------------------------------------------------ #
-    # Asset detection
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _detect_asset(market: Mapping[str, Any]) -> Optional[str]:
-        """Infer crypto asset symbol from Kalshi market/event metadata."""
         blob_parts: List[str] = []
         for key in ("ticker", "event_ticker", "series_ticker"):
             value = market.get(key)
@@ -204,12 +208,10 @@ class CryptoAdapter(TradingLoggerMixin):
             return None
         upper = blob.upper()
 
-        # Kalshi's short-dated crypto series use KX<ASSET>D style tickers.
         for symbol in ASSET_REGISTRY:
             if re.search(rf"\bKX{symbol}", upper):
                 return symbol
 
-        # Fall back to full-word matches in title text.
         lower = blob.lower()
         keyword_map = {
             "BTC": ("bitcoin", "btc"),
@@ -224,9 +226,44 @@ class CryptoAdapter(TradingLoggerMixin):
                     return symbol
         return None
 
-    # ------------------------------------------------------------------ #
-    # Network fetchers (cached, retried)
-    # ------------------------------------------------------------------ #
+    async def _spot_with_fallback(
+        self, coingecko_id: str, coinbase_product: str
+    ) -> Dict[str, Any]:
+        try:
+            return await self._spot(coingecko_id)
+        except Exception as primary_error:
+            self.logger.warning(
+                "coingecko spot unavailable; trying coinbase fallback",
+                asset=coingecko_id,
+                error=str(primary_error),
+            )
+            try:
+                return await self._coinbase_spot(coinbase_product)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"spot providers failed: coingecko={primary_error}; "
+                    f"coinbase={fallback_error}"
+                ) from fallback_error
+
+    async def _bars_with_fallback(
+        self, coingecko_id: str, coinbase_product: str
+    ) -> Dict[str, Any]:
+        try:
+            return await self._bars(coingecko_id)
+        except Exception as primary_error:
+            self.logger.warning(
+                "coingecko chart unavailable; trying coinbase fallback",
+                asset=coingecko_id,
+                error=str(primary_error),
+            )
+            try:
+                return await self._coinbase_bars(coinbase_product)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"bar providers failed: coingecko={primary_error}; "
+                    f"coinbase={fallback_error}"
+                ) from fallback_error
+
     async def _spot(self, coingecko_id: str) -> Dict[str, Any]:
         cached = self._spot_cache.get(coingecko_id)
         if cached and (time.monotonic() - cached[0]) < self.cache_ttl_seconds:
@@ -240,25 +277,44 @@ class CryptoAdapter(TradingLoggerMixin):
         )
         data = await self._request_json(url)
         block = data.get(coingecko_id, {}) if isinstance(data, dict) else {}
+        price = _safe_float(block.get("usd"))
+        if price is None:
+            raise ValueError("coingecko_spot_missing_price")
         snapshot = {
-            "price_usd": _safe_float(block.get("usd")),
+            "price_usd": price,
             "change_24h_pct": _safe_float(block.get("usd_24h_change")),
             "volume_24h_usd": _safe_float(block.get("usd_24h_vol")),
             "market_cap_usd": _safe_float(block.get("usd_market_cap")),
             "last_updated_at": block.get("last_updated_at"),
+            "provider": "coingecko",
         }
         self._spot_cache[coingecko_id] = (time.monotonic(), snapshot)
         return snapshot
 
-    async def _bars(self, coingecko_id: str) -> Dict[str, Any]:
-        """Pull the last 24h of price points and downsample to 1m/5m bars.
+    async def _coinbase_spot(self, product: str) -> Dict[str, Any]:
+        cache_key = f"coinbase:{product}"
+        cached = self._spot_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < self.cache_ttl_seconds:
+            return cached[1]
 
-        CoinGecko free tier's ``market_chart`` returns ~5-minute resolution
-        for ``days=1``. We expose the raw points as 5m bars and stride-sample
-        them into 1m-tagged entries (actually 5m stride but labeled so the
-        agent has a consistent structure once we upgrade to a minute-resolution
-        provider).
-        """
+        data = await self._request_json(f"{self.COINBASE_BASE}/products/{product}/ticker")
+        if not isinstance(data, dict):
+            raise ValueError("unexpected_coinbase_ticker_payload")
+        price = _safe_float(data.get("price"))
+        if price is None:
+            raise ValueError("coinbase_spot_missing_price")
+        snapshot = {
+            "price_usd": price,
+            "change_24h_pct": None,
+            "volume_24h_usd": None,
+            "market_cap_usd": None,
+            "last_updated_at": data.get("time"),
+            "provider": "coinbase",
+        }
+        self._spot_cache[cache_key] = (time.monotonic(), snapshot)
+        return snapshot
+
+    async def _bars(self, coingecko_id: str) -> Dict[str, Any]:
         cached = self._chart_cache.get(coingecko_id)
         if cached and (time.monotonic() - cached[0]) < self.cache_ttl_seconds:
             return cached[1]
@@ -269,7 +325,6 @@ class CryptoAdapter(TradingLoggerMixin):
         )
         data = await self._request_json(url)
         points = data.get("prices", []) if isinstance(data, dict) else []
-        # Points come back as [timestamp_ms, price]. Build OHLC-ish bars.
         bars = []
         for point in points:
             if not isinstance(point, list) or len(point) < 2:
@@ -278,20 +333,55 @@ class CryptoAdapter(TradingLoggerMixin):
             price = _safe_float(point[1])
             if ts_ms is None or price is None:
                 continue
-            bars.append({
-                "timestamp_utc": datetime.fromtimestamp(
-                    ts_ms / 1000.0, tz=timezone.utc
-                ).isoformat(timespec="seconds"),
-                "price_usd": price,
-            })
-        # Last 60 points ≈ last 5 hours at 5m resolution.
-        bars_5m = bars[-60:]
-        # 1m bars aren't available from CoinGecko free tier; expose the last
-        # 12 points as a short-window lookalike so live-trade consumers can treat
-        # them as "recent" without a separate code path.
-        bars_1m = bars[-12:]
-        result = {"bars_5m": bars_5m, "bars_1m": bars_1m}
+            bars.append(
+                {
+                    "timestamp_utc": datetime.fromtimestamp(
+                        ts_ms / 1000.0, tz=timezone.utc
+                    ).isoformat(timespec="seconds"),
+                    "price_usd": price,
+                    "provider": "coingecko",
+                }
+            )
+        if not bars:
+            raise ValueError("coingecko_chart_missing_prices")
+        result = {"bars_5m": bars[-60:], "bars_1m": bars[-12:]}
         self._chart_cache[coingecko_id] = (time.monotonic(), result)
+        return result
+
+    async def _coinbase_bars(self, product: str) -> Dict[str, Any]:
+        cache_key = f"coinbase:{product}"
+        cached = self._chart_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < self.cache_ttl_seconds:
+            return cached[1]
+
+        url = f"{self.COINBASE_BASE}/products/{product}/candles?granularity=300"
+        data = await self._request_json(url)
+        if not isinstance(data, list):
+            raise ValueError("unexpected_coinbase_candles_payload")
+
+        bars: List[Dict[str, Any]] = []
+        for row in data:
+            # Coinbase candle format: [time, low, high, open, close, volume].
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            ts = _safe_float(row[0])
+            close = _safe_float(row[4])
+            if ts is None or close is None:
+                continue
+            bars.append(
+                {
+                    "timestamp_utc": datetime.fromtimestamp(
+                        ts, tz=timezone.utc
+                    ).isoformat(timespec="seconds"),
+                    "price_usd": close,
+                    "provider": "coinbase",
+                }
+            )
+        if not bars:
+            raise ValueError("coinbase_candles_missing_prices")
+        bars.sort(key=lambda item: item["timestamp_utc"])
+        result = {"bars_5m": bars[-60:], "bars_1m": bars[-12:]}
+        self._chart_cache[cache_key] = (time.monotonic(), result)
         return result
 
     async def _funding(self, binance_symbol: str) -> Dict[str, Any]:
@@ -322,6 +412,7 @@ class CryptoAdapter(TradingLoggerMixin):
             "index_price_usd": _safe_float(data.get("indexPrice")),
             "last_funding_rate": _safe_float(data.get("lastFundingRate")),
             "next_funding_at_utc": next_iso,
+            "provider": "binance",
         }
         self._funding_cache[binance_symbol] = (time.monotonic(), snapshot)
         return snapshot
@@ -337,7 +428,7 @@ class CryptoAdapter(TradingLoggerMixin):
                 last_error = exc
                 if attempt >= self.max_retries:
                     break
-                await asyncio.sleep(self.retry_backoff * (2 ** attempt))
+                await asyncio.sleep(self.retry_backoff * (2**attempt))
         assert last_error is not None
         raise last_error
 
@@ -347,7 +438,6 @@ async def fetch_context(
     *,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
-    """Module-level wrapper that honours the uniform adapter contract."""
     adapter = CryptoAdapter(http_client=http_client)
     try:
         return await adapter.fetch_context(market)
