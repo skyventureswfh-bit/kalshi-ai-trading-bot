@@ -1,0 +1,36 @@
+name: Apply participation gate patch
+
+on:
+  push:
+    branches:
+      - sage/participation-gate-fix
+    paths:
+      - .github/workflows/apply-participation-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: sage/participation-gate-fix
+          fetch-depth: 0
+
+      - name: Apply surgical prompt patch
+        shell: bash
+        run: |
+          git apply patches/participation-gate-fix.patch
+          git diff --check
+
+      - name: Commit patched live_trade.py
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/jobs/live_trade.py
+          git commit -m "Loosen specialist participation gate"
+          git push origin HEAD:sage/participation-gate-fix
