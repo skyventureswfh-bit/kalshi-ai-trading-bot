@@ -560,6 +560,42 @@ class SportsConfig:
     )
 
 
+@dataclass
+class AutoConfig:
+    """
+    Beast Auto V1 — unattended supervisor configuration.
+
+    This governs only the autonomous loop wrapper (src/auto/runner.py). It
+    does not change any decision, sizing, or risk-gate logic — those remain
+    exactly as configured elsewhere. Auto reuses the existing live-trade
+    decision loop and execution path; this config controls cadence, the
+    fail-closed kill switch, and consecutive-failure shutdown behavior.
+    """
+
+    # Seconds to sleep between Auto decision-loop cycles.
+    cadence_seconds: int = field(
+        default_factory=lambda: int(os.getenv("AUTO_CADENCE_SECONDS", "60"))
+    )
+    # Consecutive cycle failures before Auto halts itself fail-closed.
+    max_consecutive_failures: int = field(
+        default_factory=lambda: int(os.getenv("AUTO_MAX_CONSECUTIVE_FAILURES", "3"))
+    )
+    # Path to the fail-closed kill-switch state file. If this file cannot be
+    # read (missing is fine and means "not killed"; corrupt/unreadable is
+    # NOT fine and is treated as killed), Auto blocks new buys.
+    kill_switch_path: str = field(
+        default_factory=lambda: os.getenv(
+            "AUTO_KILL_SWITCH_PATH", "data/auto_kill_switch.json"
+        )
+    )
+    # Strategy label Auto checks against the existing strategy_halts table
+    # before running a cycle. Matches the label the live-trade loop already
+    # uses so Auto respects halts raised by the existing pipeline.
+    halt_strategy_label: str = field(
+        default_factory=lambda: os.getenv("AUTO_HALT_STRATEGY_LABEL", "live_trade")
+    )
+
+
 # Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
 # Beast mode is still available via --beast flag, but NOT the default.
 # Discipline defaults based on live prediction market trading experience.
@@ -1102,6 +1138,7 @@ class Settings:
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
     sports: SportsConfig = field(default_factory=SportsConfig)
+    auto: AutoConfig = field(default_factory=AutoConfig)
 
     def validate(self) -> bool:
         """Validate configuration settings."""
@@ -1287,6 +1324,12 @@ class Settings:
         if missing_roles:
             missing = ", ".join(sorted(missing_roles))
             raise ValueError(f"ensemble config is missing required roles: {missing}")
+
+        if self.auto.cadence_seconds <= 0:
+            raise ValueError("AUTO_CADENCE_SECONDS must be positive")
+
+        if self.auto.max_consecutive_failures <= 0:
+            raise ValueError("AUTO_MAX_CONSECUTIVE_FAILURES must be positive")
 
         return True
 

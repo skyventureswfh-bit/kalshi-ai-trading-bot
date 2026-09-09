@@ -1,0 +1,54 @@
+name: Beast Auto Validation
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate-beast-auto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-asyncio
+
+      - name: Compile touched Beast modules
+        run: |
+          python -m py_compile \
+            cli.py \
+            src/auto/__init__.py \
+            src/auto/guarded_kalshi_client.py \
+            src/auto/intent_ledger.py \
+            src/auto/kill_switch.py \
+            src/auto/runner.py \
+            src/clients/openrouter_cost_guard.py \
+            src/config/settings.py \
+            src/jobs/execute.py \
+            src/utils/database.py
+
+      - name: Run Beast Auto focused tests
+        env:
+          KALSHI_API_KEY: ci-placeholder
+          OPENROUTER_API_KEY: ci-placeholder
+          LLM_PROVIDER: openrouter
+        run: |
+          pytest -q \
+            tests/test_openrouter_cost_guard.py \
+            tests/test_auto_guarded_kalshi_client.py \
+            tests/test_auto_idempotency.py \
+            tests/test_auto_kill_switch.py \
+            tests/test_auto_runner.py \
+            tests/test_auto_openrouter_circuit_breaker.py

@@ -1240,9 +1240,18 @@ async def execute_position(
     *,
     shadow_mode: Optional[bool] = None,
     paper_market_info: Optional[Dict[str, Any]] = None,
+    client_order_id: Optional[str] = None,
 ) -> bool:
     """
     Execute a single trade position.
+
+    Args:
+        client_order_id: Optional caller-supplied client order ID for the
+            live entry order. Defaults to None, which preserves existing
+            behavior exactly — a random UUID is generated internally, as
+            before. Callers that need idempotent retries (e.g. an
+            unattended supervisor) may pass a deterministic value here;
+            Manual/interactive call sites should never set this.
 
     Returns:
         True when the position was successfully activated, otherwise False.
@@ -1513,7 +1522,7 @@ async def execute_position(
                 ticker=position.market_id,
             )
 
-        client_order_id = str(uuid.uuid4())
+        client_order_id = client_order_id or str(uuid.uuid4())
         order_params = {
             "ticker": position.market_id,
             "client_order_id": client_order_id,
