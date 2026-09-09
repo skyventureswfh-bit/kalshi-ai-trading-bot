@@ -13,6 +13,8 @@ Manual trade would. Auto adds only:
   - deterministic, persisted client_order_ids for buy orders, keyed to the
     stable DB position.id (see intent_ledger.py for why)
   - a consecutive-failure counter that halts Auto fail-closed
+  - a process-wide OpenRouter low-credit circuit breaker that halts Auto
+    after an unaffordable-input 402 instead of hammering the API each cycle
   - graceful SIGINT/SIGTERM shutdown
   - startup reconciliation of any order intent left in a non-terminal
     state by a prior crash (detection + bookkeeping only — V1 does not
@@ -40,6 +42,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from src.auto.guarded_kalshi_client import AutoGuardedKalshiClient
 from src.auto.intent_ledger import AutoIntentLedger, deterministic_client_order_id
 from src.auto.kill_switch import AutoKillSwitch
+from src.clients.openrouter_cost_guard import prompt_credit_exhausted
 from src.config.settings import AutoConfig
 from src.jobs.execute import execute_position
 from src.jobs.live_trade import LiveTradeDecisionLoop
@@ -49,7 +52,7 @@ logger = logging.getLogger("beast_auto")
 
 @dataclass
 class CycleOutcome:
-    status: str  # "ok" | "skipped_kill_switch" | "skipped_halted" | "failed"
+    status: str  # "ok" | "skipped_kill_switch" | "skipped_halted" | "credit_exhausted" | "failed"
     detail: Optional[str] = None
 
 
@@ -81,8 +84,8 @@ class AutoRunner:
         # the intent ledger's reconciliation reads, and the execute_position
         # wrapper below -- receives this guarded instance. SELL passes
         # through unchanged; BUY is gated immediately before the real
-        # place_order() call, closing the race window a plain pre-check in
-        # _auto_execute_position could not close.
+        # place_order() call, closing the race window that existed between
+        # this point and the actual POST.
         self.kalshi_client = AutoGuardedKalshiClient(kalshi_client, self.kill_switch)
 
         self.ledger = AutoIntentLedger(
@@ -97,31 +100,16 @@ class AutoRunner:
             kalshi_client=self.kalshi_client,
             model_router=model_router,
             execute_position_fn=self._auto_execute_position,
-            manage_quick_flip_positions_each_cycle=False,  # Quick Flip excluded from Auto V1
+            manage_quick_flip_positions_each_cycle=False,
         )
 
-    # ------------------------------------------------------------------
-    # The execute_position_fn wrapper — this is the ONLY place Auto-specific
-    # behavior touches the execution path. live_trade.py itself is unmodified.
-    # ------------------------------------------------------------------
     async def _auto_execute_position(self, **kwargs: Any) -> bool:
         position = kwargs["position"]
         live_mode = kwargs.get("live_mode", False)
 
         if not live_mode:
-            # Paper/shadow: no idempotency concerns, no kill-switch gate.
-            # Delegate exactly as Manual would.
             return await execute_position(**kwargs)
 
-        # Cheap early short-circuit: avoids the quote fetch and safety
-        # re-check inside execute_position() when we already know we're
-        # killed. This is NOT the authoritative check -- that's
-        # AutoGuardedKalshiClient.place_order(), which re-checks
-        # immediately before the real exchange call, closing the race
-        # window that existed between this point and the actual POST
-        # (quote fetch, safety re-check, and price-limit checks all
-        # happen in between and could otherwise race a kill activated
-        # mid-cycle).
         if self.kill_switch.is_active():
             logger.warning(
                 "Auto kill switch active — blocking buy for %s (%s)",
@@ -157,9 +145,6 @@ class AutoRunner:
         )
         return success
 
-    # ------------------------------------------------------------------
-    # Startup reconciliation
-    # ------------------------------------------------------------------
     async def reconcile_on_startup(self) -> List[Dict[str, Any]]:
         """
         Check every non-terminal Auto order intent against Kalshi's own
@@ -167,12 +152,7 @@ class AutoRunner:
 
         V1 scope: detection and bookkeeping ONLY. This does NOT
         automatically resubmit an order, even when reconciliation
-        determines a retry would be safe (order never reached the
-        exchange). Automatically firing a real-money buy based on an
-        inferred absence is a materially different risk decision than
-        "supervise the existing pipeline," and the locked plan did not
-        explicitly authorize it — flagged in the risk report for an
-        explicit decision before it's added.
+        determines a retry would be safe.
         """
         unresolved = await self.db_manager.list_unresolved_auto_order_intents(
             strategy=self.strategy_label
@@ -190,26 +170,19 @@ class AutoRunner:
             results.append(reconciled.__dict__)
         return results
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self._stop_event.set)
             except (NotImplementedError, RuntimeError):
-                # Signal handlers aren't available on every platform/thread
-                # (e.g. Windows, or when not running in the main thread).
-                # Auto still works — just without the graceful OS-signal
-                # path — so this is logged, not raised.
                 logger.warning("Could not install signal handler for %s", sig)
 
     async def _persist_heartbeat(
         self, *, loop_status: str, summary: str, error: Optional[str] = None
     ) -> None:
         try:
-            from src.utils.database import LiveTradeRuntimeState  # local import to avoid hard dependency at module load
+            from src.utils.database import LiveTradeRuntimeState
 
             await self.db_manager.upsert_live_trade_runtime_state(
                 LiveTradeRuntimeState(
@@ -229,12 +202,37 @@ class AutoRunner:
             await self._persist_heartbeat(loop_status="killed", summary="Kill switch active")
             return CycleOutcome(status="skipped_kill_switch")
 
+        # If a prior request in this process already proved the account cannot
+        # fund the input prompt, fail closed before another cycle touches the API.
+        if prompt_credit_exhausted():
+            detail = "OpenRouter credit cannot fund the live-trade prompt"
+            await self._persist_heartbeat(
+                loop_status="killed",
+                summary=detail,
+                error="openrouter_prompt_credit_exhausted",
+            )
+            return CycleOutcome(status="credit_exhausted", detail=detail)
+
         if await self.db_manager.is_strategy_halted_today(strategy=self.strategy_label):
             await self._persist_heartbeat(loop_status="halted", summary="Strategy halt active")
             return CycleOutcome(status="skipped_halted")
 
         try:
             summary = await asyncio.wait_for(self.decision_loop.run_once(), timeout=300)
+
+            # OpenRouterClient returns None on request failure, so the decision
+            # loop may complete with a skip instead of raising. Check the latch
+            # after the cycle as well; this is what converts today's repeated
+            # 402 pattern into one failed request followed by a hard Auto halt.
+            if prompt_credit_exhausted():
+                detail = "OpenRouter credit cannot fund the live-trade prompt"
+                await self._persist_heartbeat(
+                    loop_status="killed",
+                    summary=detail,
+                    error="openrouter_prompt_credit_exhausted",
+                )
+                return CycleOutcome(status="credit_exhausted", detail=detail)
+
             await self._persist_heartbeat(
                 loop_status="idle",
                 summary=getattr(summary, "skipped_reason", None) or "Cycle completed",
@@ -251,6 +249,16 @@ class AutoRunner:
 
         while not self._stop_event.is_set():
             outcome = await self.run_one_cycle()
+
+            if outcome.status == "credit_exhausted":
+                self.kill_switch.activate(
+                    reason=outcome.detail or "OpenRouter prompt credit exhausted",
+                    activated_by="auto_runner",
+                )
+                logger.error(
+                    "Auto halted fail-closed because OpenRouter cannot fund the input prompt"
+                )
+                break
 
             if outcome.status == "failed":
                 self._consecutive_failures += 1
@@ -275,6 +283,6 @@ class AutoRunner:
                     self._stop_event.wait(), timeout=self.config.cadence_seconds
                 )
             except asyncio.TimeoutError:
-                pass  # normal case: cadence elapsed, loop again
+                pass
 
         logger.info("Auto runner stopped gracefully")
