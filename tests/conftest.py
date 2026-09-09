@@ -41,3 +41,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "live_kalshi" in item.keywords:
             item.add_marker(skip_live)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_beast_auto_budget_env(request, monkeypatch):
+    """Keep legacy AutoRunner tests independent from the new AI budget gate.
+
+    Dedicated cost-circuit-breaker tests explicitly set and verify
+    AUTO_AI_DAILY_COST_LIMIT. Older supervisor tests use MagicMock routers,
+    whose numeric coercion can resemble nonzero spend, so disable only this
+    extra gate for those tests and leave their intended behavior unchanged.
+    """
+    if request.node.fspath.basename == "test_auto_runner.py":
+        monkeypatch.setenv("AUTO_AI_DAILY_COST_LIMIT", "0")
