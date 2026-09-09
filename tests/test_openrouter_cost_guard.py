@@ -1,12 +1,21 @@
+import pytest
+
 from src.clients.openrouter_cost_guard import (
     _cap_live_trade_max_tokens,
     _guarded_extract_affordable_max_tokens,
+    _guarded_get_completion,
     _guarded_is_retryable_error,
+    prompt_credit_exhausted,
+    reset_prompt_credit_exhaustion_latch,
 )
 
 
 class CreditError(Exception):
     pass
+
+
+def setup_function():
+    reset_prompt_credit_exhaustion_latch()
 
 
 def test_prompt_credit_exhaustion_is_not_retried():
@@ -15,6 +24,7 @@ def test_prompt_credit_exhaustion_is_not_retried():
     )
     assert _guarded_is_retryable_error(exc) is False
     assert _guarded_extract_affordable_max_tokens(exc) is None
+    assert prompt_credit_exhausted() is True
 
 
 def test_reducible_output_credit_error_can_still_retry():
@@ -25,6 +35,22 @@ def test_reducible_output_credit_error_can_still_retry():
     affordable = _guarded_extract_affordable_max_tokens(exc)
     assert affordable is not None
     assert 0 < affordable < 500
+    assert prompt_credit_exhausted() is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_credit_latch_short_circuits_later_requests_without_network_call():
+    exc = CreditError(
+        "Error code: 402 - Prompt tokens limit exceeded; can only afford 44"
+    )
+    assert _guarded_is_retryable_error(exc) is False
+
+    # Once latched, _guarded_get_completion returns before touching `self`,
+    # proving later cycles do not keep hammering OpenRouter.
+    result = await _guarded_get_completion(
+        object(), prompt="should never be sent", strategy="live_trade"
+    )
+    assert result is None
 
 
 def test_live_trade_token_caps_are_narrow():
