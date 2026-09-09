@@ -31,11 +31,11 @@ from src.utils.logging_setup import TradingLoggerMixin
 CAPABILITY_MAP: Dict[str, List[Tuple[str, str]]] = {
     "fast": [
         ("x-ai/grok-4.1-fast", "openrouter"),
-        ("google/gemini-3.1-pro-preview", "openrouter"),
+        ("deepseek/deepseek-v3.2", "openrouter"),
     ],
     "cheap": [
         ("deepseek/deepseek-v3.2", "openrouter"),
-        ("google/gemini-3.1-pro-preview", "openrouter"),
+        ("x-ai/grok-4.1-fast", "openrouter"),
     ],
     "reasoning": [
         ("anthropic/claude-sonnet-4.5", "openrouter"),
@@ -441,10 +441,18 @@ class ModelRouter(TradingLoggerMixin):
         if model is not None:
             provider = self._infer_provider(model)
             targets.append((model, provider))
-            fleet = self._fleet_for_provider(provider)
+            if provider == "openrouter" and model in {
+                "x-ai/grok-4.1-fast",
+                "deepseek/deepseek-v3.2",
+            }:
+                fleet = list(CAPABILITY_MAP["cheap"])
+            else:
+                fleet = self._fleet_for_provider(provider)
         elif capability is not None:
             cap_targets = self._active_capability_map().get(capability, [])
             targets.extend(cap_targets)
+            if self.default_provider == "openrouter" and capability in {"fast", "cheap"}:
+                fleet = list(cap_targets)
         else:
             targets = list(fleet)
 
