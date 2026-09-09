@@ -879,11 +879,151 @@ class DatabaseManager(TradingLoggerMixin):
             )
 
             await self._create_reddit_feature_tables(db)
+            await self._create_auto_tables(db)
 
             await self._migrate_existing_strategy_data(db)
             await db.commit()
         except Exception as e:
             self.logger.error(f"Error running migrations: {e}")
+
+    async def _create_auto_tables(self, db: aiosqlite.Connection) -> None:
+        """
+        Create the single additive table backing Beast Auto's idempotency
+        ledger. Auto V1 persists an order intent here BEFORE submitting to
+        Kalshi, keyed by a deterministic client_order_id, so a crash/restart
+        can reconcile against what actually reached the exchange instead of
+        blindly retrying. This table is read/written only by src/auto/ code;
+        it does not alter any existing table or existing query.
+        """
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS auto_order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_order_id TEXT NOT NULL UNIQUE,
+                strategy TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                position_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                kalshi_order_id TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_order_intents_status "
+            "ON auto_order_intents(status, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_order_intents_position "
+            "ON auto_order_intents(position_id)"
+        )
+
+    async def record_auto_order_intent(
+        self,
+        *,
+        client_order_id: str,
+        strategy: str,
+        ticker: str,
+        side: str,
+        position_id: Optional[int] = None,
+    ) -> None:
+        """
+        Persist an Auto order intent BEFORE submission. Idempotent: if this
+        client_order_id was already recorded (e.g. a retry after a crash
+        that reuses the same deterministic ID), this is a no-op rather than
+        a duplicate row or an error.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO auto_order_intents (
+                    client_order_id, strategy, ticker, side, position_id,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(client_order_id) DO NOTHING
+                """,
+                (client_order_id, strategy, ticker, side, position_id, now, now),
+            )
+            await db.commit()
+
+    async def update_auto_order_intent_status(
+        self,
+        *,
+        client_order_id: str,
+        status: str,
+        kalshi_order_id: Optional[str] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        """Update an Auto order intent's status after submission/reconciliation."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE auto_order_intents
+                SET status = ?, kalshi_order_id = COALESCE(?, kalshi_order_id),
+                    last_error = ?, updated_at = ?
+                WHERE client_order_id = ?
+                """,
+                (status, kalshi_order_id, last_error, now, client_order_id),
+            )
+            await db.commit()
+
+    async def get_auto_order_intent(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single Auto order intent by its client_order_id."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM auto_order_intents WHERE client_order_id = ? LIMIT 1",
+                (client_order_id,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def list_unresolved_auto_order_intents(
+        self, *, strategy: str = "live_trade"
+    ) -> List[Dict[str, Any]]:
+        """
+        Return Auto order intents still in a non-terminal state (pending or
+        submitted, i.e. not yet confirmed filled/voided/failed). Used on
+        startup to reconcile against Kalshi before resuming new cycles.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM auto_order_intents
+                WHERE strategy = ? AND status IN ('pending', 'submitted')
+                ORDER BY created_at ASC
+                """,
+                (strategy,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def is_strategy_halted_today(self, *, strategy: str) -> bool:
+        """
+        Check the existing strategy_halts table for a halt recorded today
+        for the given strategy label. Read-only — Auto never writes to this
+        table; it only respects halts the existing pipeline already raised.
+        """
+        halt_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT 1 FROM strategy_halts WHERE strategy = ? AND halt_date = ? LIMIT 1",
+                    (strategy, halt_date),
+                )
+                row = await cursor.fetchone()
+                return row is not None
+        except Exception as exc:
+            self.logger.error(
+                "Failed to check strategy_halts; failing closed (treating as halted)",
+                strategy=strategy,
+                error=str(exc),
+            )
+            return True
 
     async def _create_reddit_feature_tables(self, db: aiosqlite.Connection) -> None:
         """Create additive tables for safety, adapters, arbitrage, and calibration."""

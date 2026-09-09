@@ -1743,6 +1743,68 @@ def cmd_safety_status(args: argparse.Namespace) -> None:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+def cmd_auto(args: argparse.Namespace) -> None:
+    """
+    Beast Auto V1 — unattended supervisor around the existing live-trade
+    decision/risk/execution pipeline. Manual (`run --live-trade`,
+    `run --live`, etc.) is completely separate and unaffected by this
+    command. Quick Flip is never touched by Auto.
+    """
+    from src.auto.kill_switch import AutoKillSwitch
+    from src.config.settings import settings
+
+    if args.auto_action == "kill":
+        switch = AutoKillSwitch(settings.auto.kill_switch_path)
+        switch.activate(reason=args.reason or "manual operator kill", activated_by="cli")
+        print(f"Auto kill switch ACTIVATED ({settings.auto.kill_switch_path}).")
+        return
+
+    if args.auto_action == "resume":
+        switch = AutoKillSwitch(settings.auto.kill_switch_path)
+        switch.deactivate(deactivated_by="cli")
+        print(f"Auto kill switch DEACTIVATED ({settings.auto.kill_switch_path}).")
+        return
+
+    if args.auto_action == "status":
+        switch = AutoKillSwitch(settings.auto.kill_switch_path)
+        state = switch.read_state()
+        print("=" * 60)
+        print("  BEAST AUTO STATUS")
+        print("=" * 60)
+        print(f"  Kill switch active: {state.active}")
+        if state.reason:
+            print(f"  Reason: {state.reason}")
+        if state.activated_by:
+            print(f"  Set by: {state.activated_by}")
+        print(f"  Cadence: {settings.auto.cadence_seconds}s")
+        print(f"  Max consecutive failures before auto-halt: {settings.auto.max_consecutive_failures}")
+        print("=" * 60)
+        return
+
+    # args.auto_action == "start"
+    if not args.live:
+        print(
+            "Refusing to start: Beast Auto V1 requires --live to submit real "
+            "orders. There is no paper/shadow mode for Auto in V1 — use "
+            "`python cli.py run --live-trade` for paper/shadow supervision."
+        )
+        return
+
+    async def _run() -> None:
+        from src.auto.runner import AutoRunner
+        from src.clients.kalshi_client import KalshiClient
+        from src.utils.database import DatabaseManager
+
+        db_manager = DatabaseManager()
+        await db_manager.initialize()
+        async with KalshiClient() as kalshi_client:
+            runner = AutoRunner(db_manager=db_manager, kalshi_client=kalshi_client)
+            print("Beast Auto V1 starting (LIVE). Ctrl-C for graceful shutdown.")
+            await runner.run_forever()
+
+    asyncio.run(_run())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kalshi-bot",
@@ -2024,6 +2086,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--fit", action="store_true", help="Force a market-prior refit afterwards"
     )
     p_backfill.set_defaults(func=cmd_backfill_results)
+
+    # --- auto ---
+    p_auto = subparsers.add_parser(
+        "auto",
+        help="Beast Auto V1 -- unattended live-trade supervisor (separate from Manual)",
+        description=(
+            "Beast Auto V1 wraps the existing live-trade decision/risk/"
+            "execution pipeline in an unattended loop with a dedicated "
+            "fail-closed kill switch and idempotent order submission. "
+            "Manual (`run --live-trade`, `run --live`) is unaffected. "
+            "Quick Flip is never touched by Auto."
+        ),
+    )
+    p_auto.add_argument(
+        "auto_action",
+        choices=["start", "kill", "resume", "status"],
+        help=(
+            "start: run the Auto supervisor loop. "
+            "kill: activate the fail-closed kill switch (blocks new buys). "
+            "resume: deactivate the kill switch. "
+            "status: show current kill-switch state and Auto config."
+        ),
+    )
+    p_auto.add_argument(
+        "--live",
+        action="store_true",
+        help="Required for `start` -- Auto V1 has no paper/shadow mode; submits real orders.",
+    )
+    p_auto.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason recorded when using `kill`.",
+    )
+    p_auto.set_defaults(func=cmd_auto)
 
     # --- fit-market-prior ---
     p_fit_prior = subparsers.add_parser(
