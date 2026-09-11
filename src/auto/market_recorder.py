@@ -74,6 +74,15 @@ class JsonlMarketRecorder:
         self.record(first)
         self.record(second)
 
+    def reset_source_ordering(self, source: str) -> None:
+        """Start a new authoritative stream epoch for one source.
+
+        WebSocket sequence numbers can restart after a reconnect.  A fresh
+        order-book snapshot is the boundary that makes that reset safe.
+        """
+        self._last_event_by_source.pop(source, None)
+        self._last_sequence_by_source.pop(source, None)
+
     def _validate(self, item: MarketObservation) -> None:
         numeric = (item.received_epoch, item.event_epoch, item.target, item.seconds_remaining)
         if not all(isfinite(value) for value in numeric):

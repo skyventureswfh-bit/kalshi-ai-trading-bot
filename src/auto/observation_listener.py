@@ -13,7 +13,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from src.auto.kalshi_feed_parser import LiveOrderBook, parse_cfbenchmarks_value, parse_orderbook_snapshot
+from src.auto.kalshi_feed_parser import (
+    LiveOrderBook,
+    OrderBookDesynchronized,
+    parse_cfbenchmarks_value,
+    parse_orderbook_snapshot,
+)
 from src.auto.market_recorder import JsonlMarketRecorder, MarketObservation, UnsafeObservation
 
 
@@ -54,6 +59,7 @@ class ObservationListener:
         self._stop = asyncio.Event()
         self._orderbook = LiveOrderBook()
         self.dropped_observations = 0
+        self.orderbook_resyncs = 0
         self.last_rejection_reason: Optional[str] = None
 
     def stop(self) -> None:
@@ -104,7 +110,16 @@ class ObservationListener:
                             raw = await asyncio.wait_for(socket.recv(), timeout=min(5.0, remaining))
                         except asyncio.TimeoutError:
                             continue
-                        self.process_frame(json.loads(raw), local_received_epoch=self.clock())
+                        try:
+                            self.process_frame(json.loads(raw), local_received_epoch=self.clock())
+                        except OrderBookDesynchronized as exc:
+                            # Reconnect to force Kalshi to send a new authoritative
+                            # snapshot before any more deltas reach the strategy.
+                            self.orderbook_resyncs += 1
+                            self.last_rejection_reason = str(exc)
+                            self._orderbook = LiveOrderBook()
+                            LOGGER.warning("orderbook desynchronized; reconnecting: %s", exc)
+                            break
             except asyncio.CancelledError:
                 raise
             except UnsafeObservation:
@@ -125,6 +140,7 @@ class ObservationListener:
             )
         elif frame_type == "orderbook_snapshot":
             self._orderbook.load_snapshot(frame)
+            self.recorder.reset_source_ordering("kalshi_orderbook")
             item = parse_orderbook_snapshot(
                 frame, target=self.config.target, seconds_remaining=seconds_remaining,
                 received_epoch=local_received_epoch,

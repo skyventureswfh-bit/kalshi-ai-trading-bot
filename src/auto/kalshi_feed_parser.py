@@ -9,6 +9,10 @@ from typing import Any, Dict, Optional, Tuple
 from src.auto.market_recorder import MarketObservation, UnsafeObservation
 
 
+class OrderBookDesynchronized(UnsafeObservation):
+    """The incremental book is unsafe until a fresh snapshot is received."""
+
+
 class LiveOrderBook:
     """Maintain top-of-book from one snapshot followed by ordered deltas."""
 
@@ -33,23 +37,23 @@ class LiveOrderBook:
 
     def apply_delta(self, frame: Dict[str, Any]) -> float:
         if self.sequence is None:
-            raise UnsafeObservation("orderbook delta received before snapshot")
+            raise OrderBookDesynchronized("orderbook delta received before snapshot")
         if frame.get("type") != "orderbook_delta" or int(frame["sid"]) != self.sid:
-            raise UnsafeObservation("orderbook delta stream mismatch")
+            raise OrderBookDesynchronized("orderbook delta stream mismatch")
         sequence = int(frame["seq"])
         if sequence != self.sequence + 1:
-            raise UnsafeObservation("orderbook sequence gap")
+            raise OrderBookDesynchronized("orderbook sequence gap")
         msg = frame.get("msg") or {}
         if str(msg["market_ticker"]) != self.ticker:
-            raise UnsafeObservation("orderbook delta market mismatch")
+            raise OrderBookDesynchronized("orderbook delta market mismatch")
         side = str(msg["side"]).lower()
         levels = self.yes if side == "yes" else self.no if side == "no" else None
         if levels is None:
-            raise UnsafeObservation("unknown orderbook side")
+            raise OrderBookDesynchronized("unknown orderbook side")
         price = Decimal(str(msg["price_dollars"])) * Decimal("100")
         quantity = levels.get(price, Decimal("0")) + Decimal(str(msg["delta_fp"]))
         if quantity < 0:
-            raise UnsafeObservation("orderbook quantity became negative")
+            raise OrderBookDesynchronized("orderbook quantity became negative")
         if quantity == 0:
             levels.pop(price, None)
         else:

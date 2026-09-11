@@ -40,6 +40,15 @@ def test_recorder_has_no_execution_surface(tmp_path):
     assert forbidden.isdisjoint(dir(recorder))
 
 
+def test_authoritative_snapshot_can_reset_source_sequence(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(sequence=10))
+    recorder.reset_source_ordering("kalshi")
+    recorder.record(_observation(event_epoch=101.0, received_epoch=101.1, sequence=2))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_synchronized_pair_enforces_cross_source_skew(tmp_path):
     path = tmp_path / "observations.jsonl"
     recorder = JsonlMarketRecorder(str(path))

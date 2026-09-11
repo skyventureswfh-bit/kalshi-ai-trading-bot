@@ -70,3 +70,18 @@ def test_complete_official_window_stops_session(tmp_path):
     }
     listener.process_frame(frame, local_received_epoch=1710000000.2)
     assert listener._stop.is_set()
+
+
+def test_fresh_snapshot_resets_orderbook_sequence_epoch(tmp_path):
+    listener, _ = _listener(tmp_path)
+    first = {"type": "orderbook_snapshot", "sid": 2, "seq": 10,
+             "msg": {"market_ticker": "KXBTC15M-TEST",
+                     "yes_dollars_fp": [["0.4800", "10"]],
+                     "no_dollars_fp": [["0.4900", "8"]]}}
+    fresh = {"type": "orderbook_snapshot", "sid": 3, "seq": 2,
+             "msg": {"market_ticker": "KXBTC15M-TEST",
+                     "yes_dollars_fp": [["0.5000", "12"]],
+                     "no_dollars_fp": [["0.4700", "9"]]}}
+    assert listener.process_frame(first, local_received_epoch=1710000000.2)
+    assert listener.process_frame(fresh, local_received_epoch=1710000000.3)
+    assert len(listener.recorder.path.read_text().splitlines()) == 2

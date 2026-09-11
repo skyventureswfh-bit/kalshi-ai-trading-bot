@@ -117,6 +117,11 @@ async def capture(args: argparse.Namespace) -> dict:
     )
     await listener.run_forever()
     result = summarize_capture(output).as_dict()
+    result["feed_safety"] = {
+        "dropped_observations": listener.dropped_observations,
+        "orderbook_resyncs": listener.orderbook_resyncs,
+        "last_rejection_reason": listener.last_rejection_reason,
+    }
     if wave_session is not None:
         result["wave_paper"] = asdict(wave_session.scorecard)
         result["wave_journal"] = wave_journal_path
