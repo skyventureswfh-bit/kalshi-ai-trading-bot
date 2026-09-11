@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -18,6 +19,7 @@ from src.auto.market_recorder import JsonlMarketRecorder, MarketObservation, Uns
 
 PRODUCTION_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 WS_SIGNING_PATH = "/trade-api/ws/v2"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,8 @@ class ObservationListener:
         self.on_observation = on_observation
         self._stop = asyncio.Event()
         self._orderbook = LiveOrderBook()
+        self.dropped_observations = 0
+        self.last_rejection_reason: Optional[str] = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -148,7 +152,16 @@ class ObservationListener:
             raise UnsafeObservation(f"Kalshi WebSocket error: {frame.get('msg')}")
         else:
             return False
-        self.recorder.record(item)
+        try:
+            self.recorder.record(item)
+        except UnsafeObservation as exc:
+            # A single stale or timestamp-reordered observation is not a reason
+            # to kill a read-only capture.  It must never reach the strategy,
+            # but the listener can safely keep waiting for the next frame.
+            self.dropped_observations += 1
+            self.last_rejection_reason = str(exc)
+            LOGGER.warning("dropped unsafe market observation: %s", exc)
+            return False
         if self.on_observation is not None:
             self.on_observation(item)
         if (item.official_average_window_size is not None
