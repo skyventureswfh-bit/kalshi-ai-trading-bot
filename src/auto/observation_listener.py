@@ -41,12 +41,14 @@ class ObservationListener:
         sign_request: Callable[[str, str, str], str],
         websocket_connect: Optional[Callable[..., Any]] = None,
         clock: Callable[[], float] = time.time,
+        on_observation: Optional[Callable[[MarketObservation], None]] = None,
     ) -> None:
         self.config = config
         self.recorder = recorder
         self.sign_request = sign_request
         self.websocket_connect = websocket_connect
         self.clock = clock
+        self.on_observation = on_observation
         self._stop = asyncio.Event()
         self._orderbook = LiveOrderBook()
 
@@ -147,6 +149,8 @@ class ObservationListener:
         else:
             return False
         self.recorder.record(item)
+        if self.on_observation is not None:
+            self.on_observation(item)
         if (item.official_average_window_size is not None
                 and item.official_average_window_size >= 60):
             self._stop.set()

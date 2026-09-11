@@ -1750,6 +1750,10 @@ def cmd_observe_btc(args: argparse.Namespace) -> None:
     capture_args = ["--series", args.series]
     if args.output:
         capture_args.extend(["--output", args.output])
+    if args.wave_paper:
+        capture_args.append("--wave-paper")
+    if args.wave_journal:
+        capture_args.extend(["--wave-journal", args.wave_journal])
     capture_main(capture_args)
 
 
@@ -2113,6 +2117,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_observe.add_argument(
         "--output", default=None, help="Optional JSONL output path"
+    )
+    p_observe.add_argument(
+        "--wave-paper",
+        action="store_true",
+        help="Run the locked Wave strategy on the live read-only feed; never place orders",
+    )
+    p_observe.add_argument(
+        "--wave-journal", default=None, help="Optional Wave decision/result JSONL path"
     )
     p_observe.set_defaults(func=cmd_observe_btc)
 
