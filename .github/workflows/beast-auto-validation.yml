@@ -41,6 +41,8 @@ jobs:
             src/auto/session_replay.py \
             src/auto/capture_session.py \
             src/auto/market_discovery.py \
+            src/auto/wave_strategy.py \
+            src/auto/wave_paper.py \
             src/clients/openrouter_cost_guard.py \
             src/config/settings.py \
             src/jobs/execute.py \
@@ -65,4 +67,7 @@ jobs:
             tests/test_observation_listener.py \
             tests/test_session_replay.py \
             tests/test_capture_session.py \
-            tests/test_market_discovery.py
+            tests/test_market_discovery.py \
+            tests/test_wave_strategy.py \
+            tests/test_wave_paper.py \
+            tests/test_observation_callback.py
