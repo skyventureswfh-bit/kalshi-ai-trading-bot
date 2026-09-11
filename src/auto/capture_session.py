@@ -13,6 +13,7 @@ from typing import Sequence
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
 
 from src.auto.market_recorder import JsonlMarketRecorder
 from src.auto.market_discovery import discover_open_btc_market
@@ -51,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def capture(args: argparse.Namespace) -> dict:
+    # Match the rest of Beast: credentials live in the project-root .env file.
+    # Existing process environment values still win because load_dotenv does
+    # not override them by default.
+    load_dotenv()
     api_key_id = os.environ.get("KALSHI_API_KEY", "").strip()
     private_key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip()
     if not api_key_id or not private_key_path:

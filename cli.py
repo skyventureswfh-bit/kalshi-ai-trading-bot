@@ -1743,6 +1743,16 @@ def cmd_safety_status(args: argparse.Namespace) -> None:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+def cmd_observe_btc(args: argparse.Namespace) -> None:
+    """Capture one BTC 15-minute market without exposing a trading path."""
+    from src.auto.capture_session import main as capture_main
+
+    capture_args = ["--series", args.series]
+    if args.output:
+        capture_args.extend(["--output", args.output])
+    capture_main(capture_args)
+
+
 def cmd_auto(args: argparse.Namespace) -> None:
     """
     Beast Auto V1 — unattended supervisor around the existing live-trade
@@ -1833,6 +1843,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py scan-arb                 Alert-only Kalshi/Polymarket scan\n"
             "  python cli.py safety-status            Show blocked execution attempts\n"
             "  python cli.py refresh-calibration      Rebuild settlement calibration rows\n"
+            "  python cli.py observe-btc              Record one BTC 15-minute market; never trade\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2086,6 +2097,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--fit", action="store_true", help="Force a market-prior refit afterwards"
     )
     p_backfill.set_defaults(func=cmd_backfill_results)
+
+    # --- observe-btc ---
+    p_observe = subparsers.add_parser(
+        "observe-btc",
+        help="Record one BTC 15-minute market without trading",
+        description=(
+            "Auto-discover the current KXBTC15M market, record the order book "
+            "and official CF Benchmarks settlement feed, then stop after the "
+            "complete 60-sample settlement window. This command cannot place orders."
+        ),
+    )
+    p_observe.add_argument(
+        "--series", default="KXBTC15M", help="Kalshi series ticker (default: KXBTC15M)"
+    )
+    p_observe.add_argument(
+        "--output", default=None, help="Optional JSONL output path"
+    )
+    p_observe.set_defaults(func=cmd_observe_btc)
 
     # --- auto ---
     p_auto = subparsers.add_parser(
