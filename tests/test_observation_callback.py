@@ -37,7 +37,7 @@ class ObservationCallbackTests(unittest.TestCase):
             self.assertEqual(seen[0].ticker, "KXBTC15M-TEST")
             self.assertTrue(listener.recorder.path.exists())
 
-    def test_reordered_observation_is_dropped_without_reaching_strategy(self):
+    def test_reordered_sequence_is_dropped_without_reaching_strategy(self):
         seen = []
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "observations.jsonl"
@@ -64,7 +64,7 @@ class ObservationCallbackTests(unittest.TestCase):
             }
             reordered = {
                 "type": "cfbenchmarks_value",
-                "seq": 43,
+                "seq": 41,
                 "msg": {
                     "index_id": "BRTI",
                     "received_at": 1_710_000_000_191,
@@ -76,7 +76,10 @@ class ObservationCallbackTests(unittest.TestCase):
             self.assertFalse(listener.process_frame(reordered, local_received_epoch=1_710_000_000.2))
             self.assertEqual(len(seen), 1)
             self.assertEqual(listener.dropped_observations, 1)
-            self.assertEqual(listener.last_rejection_reason, "out-of-order source timestamp")
+            self.assertEqual(
+                listener.last_rejection_reason,
+                "duplicate or out-of-order source sequence",
+            )
             self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
 
 

@@ -51,7 +51,12 @@ class JsonlMarketRecorder:
             handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        self._last_event_by_source[observation.source] = observation.event_epoch
+        previous_event = self._last_event_by_source.get(observation.source)
+        self._last_event_by_source[observation.source] = (
+            observation.event_epoch
+            if previous_event is None
+            else max(previous_event, observation.event_epoch)
+        )
         if observation.sequence is not None:
             self._last_sequence_by_source[observation.source] = observation.sequence
 
@@ -94,10 +99,14 @@ class JsonlMarketRecorder:
         if item.received_epoch - item.event_epoch > self.max_staleness_seconds:
             raise UnsafeObservation("stale observation")
         previous_event = self._last_event_by_source.get(item.source)
-        if previous_event is not None and item.event_epoch < previous_event:
+        previous_sequence = self._last_sequence_by_source.get(item.source)
+        # Kalshi can publish a newer sequenced frame whose embedded source time
+        # regresses slightly.  Sequence establishes message order; timestamp
+        # order is required only when no sequence proves the ordering.
+        if (previous_event is not None and item.event_epoch < previous_event
+                and (item.sequence is None or previous_sequence is None)):
             raise UnsafeObservation("out-of-order source timestamp")
         if item.sequence is not None:
-            previous_sequence = self._last_sequence_by_source.get(item.source)
             if previous_sequence is not None and item.sequence <= previous_sequence:
                 raise UnsafeObservation("duplicate or out-of-order source sequence")
         book_fields = ("yes_bid_cents", "yes_ask_cents", "no_bid_cents", "no_ask_cents")

@@ -59,8 +59,12 @@ class WavePaperSession:
 
     def on_observation(self, item: MarketObservation) -> Optional[PaperWaveEvent]:
         if item.source == "kalshi_cfbenchmarks_brti" and item.brti is not None:
+            if self._brti is not None and item.event_epoch < self._brti.event_epoch:
+                return None
             self._brti = item
         elif item.source == "kalshi_orderbook":
+            if self._book is not None and item.event_epoch < self._book.event_epoch:
+                return None
             self._book = item
         else:
             return None

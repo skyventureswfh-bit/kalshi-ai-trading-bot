@@ -56,6 +56,12 @@ class WavePaperSessionTests(unittest.TestCase):
         session.on_observation(_brti(1000.0, 77_100.0))
         self.assertIsNone(session.on_observation(_book(1002.0, 58.0, 60.0)))
 
+    def test_regressed_source_time_never_replaces_current_state(self):
+        session = WavePaperSession()
+        self.assertIsNone(session.on_observation(_brti(1000.2, 77_100.0)))
+        self.assertIsNone(session.on_observation(_brti(1000.1, 77_099.0)))
+        self.assertEqual(session._brti.event_epoch, 1000.2)
+
     def test_paper_exit_updates_scorecard_and_market_stays_locked(self):
         session = WavePaperSession()
         self._feed_clean_up_wave(session)

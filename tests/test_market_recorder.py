@@ -30,8 +30,16 @@ def test_recorder_rejects_stale_or_reordered_data_without_appending(tmp_path):
     with pytest.raises(UnsafeObservation, match="stale"):
         recorder.record(_observation(event_epoch=101.0, received_epoch=104.0, sequence=2))
     with pytest.raises(UnsafeObservation, match="out-of-order"):
-        recorder.record(_observation(event_epoch=99.0, received_epoch=99.1, sequence=2))
+        recorder.record(_observation(event_epoch=99.0, received_epoch=99.1, sequence=None))
     assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_newer_sequence_allows_source_timestamp_regression(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation())
+    recorder.record(_observation(event_epoch=100.0, received_epoch=100.3, sequence=2))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_recorder_has_no_execution_surface(tmp_path):
