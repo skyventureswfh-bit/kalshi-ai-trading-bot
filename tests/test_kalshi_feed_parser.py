@@ -49,3 +49,20 @@ def test_live_book_applies_delta_and_rejects_sequence_gap():
                           "msg": {"market_ticker": "KXBTC15M-TEST",
                                   "price_dollars": "0.5100", "delta_fp": "1",
                                   "side": "yes", "ts_ms": 1710000000400}})
+
+
+def test_live_book_uses_exact_fixed_point_quantities():
+    book = LiveOrderBook()
+    book.load_snapshot({"type": "orderbook_snapshot", "sid": 2, "seq": 2,
+                        "msg": {"market_ticker": "KXBTC15M-TEST",
+                                "yes_dollars_fp": [["0.4800", "0.30"]],
+                                "no_dollars_fp": []}})
+    book.apply_delta({"type": "orderbook_delta", "sid": 2, "seq": 3,
+                      "msg": {"market_ticker": "KXBTC15M-TEST",
+                              "price_dollars": "0.4800", "delta_fp": "-0.10",
+                              "side": "yes", "ts_ms": 1710000000300}})
+    book.apply_delta({"type": "orderbook_delta", "sid": 2, "seq": 4,
+                      "msg": {"market_ticker": "KXBTC15M-TEST",
+                              "price_dollars": "0.4800", "delta_fp": "-0.20",
+                              "side": "yes", "ts_ms": 1710000000400}})
+    assert book.top() == (None, None, None, None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
 from src.auto.market_recorder import MarketObservation, UnsafeObservation
@@ -15,8 +16,10 @@ class LiveOrderBook:
         self.ticker: Optional[str] = None
         self.sid: Optional[int] = None
         self.sequence: Optional[int] = None
-        self.yes: Dict[float, float] = {}
-        self.no: Dict[float, float] = {}
+        # Kalshi sends fixed-point decimal strings.  Keep them exact internally;
+        # binary floats can turn 0.3 - 0.1 - 0.2 into a tiny negative quantity.
+        self.yes: Dict[Decimal, Decimal] = {}
+        self.no: Dict[Decimal, Decimal] = {}
 
     def load_snapshot(self, frame: Dict[str, Any]) -> None:
         if frame.get("type") != "orderbook_snapshot":
@@ -43,8 +46,8 @@ class LiveOrderBook:
         levels = self.yes if side == "yes" else self.no if side == "no" else None
         if levels is None:
             raise UnsafeObservation("unknown orderbook side")
-        price = float(msg["price_dollars"]) * 100.0
-        quantity = levels.get(price, 0.0) + float(msg["delta_fp"])
+        price = Decimal(str(msg["price_dollars"])) * Decimal("100")
+        quantity = levels.get(price, Decimal("0")) + Decimal(str(msg["delta_fp"]))
         if quantity < 0:
             raise UnsafeObservation("orderbook quantity became negative")
         if quantity == 0:
@@ -57,8 +60,12 @@ class LiveOrderBook:
     def top(self) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         yes_bid = max(self.yes, default=None)
         no_bid = max(self.no, default=None)
-        return (yes_bid, None if no_bid is None else 100.0 - no_bid,
-                no_bid, None if yes_bid is None else 100.0 - yes_bid)
+        return (
+            None if yes_bid is None else float(yes_bid),
+            None if no_bid is None else float(Decimal("100") - no_bid),
+            None if no_bid is None else float(no_bid),
+            None if yes_bid is None else float(Decimal("100") - yes_bid),
+        )
 
 
 def parse_cfbenchmarks_value(
@@ -121,6 +128,9 @@ def _top_of_book(msg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float],
     return yes_bid, yes_ask, no_bid, no_ask
 
 
-def _levels(rows: Any) -> Dict[float, float]:
-    return {float(price) * 100.0: float(quantity) for price, quantity in rows
-            if float(quantity) > 0}
+def _levels(rows: Any) -> Dict[Decimal, Decimal]:
+    return {
+        Decimal(str(price)) * Decimal("100"): Decimal(str(quantity))
+        for price, quantity in rows
+        if Decimal(str(quantity)) > 0
+    }
