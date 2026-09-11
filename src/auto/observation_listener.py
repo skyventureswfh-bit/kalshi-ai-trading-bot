@@ -176,7 +176,19 @@ class ObservationListener:
             # but the listener can safely keep waiting for the next frame.
             self.dropped_observations += 1
             self.last_rejection_reason = str(exc)
-            LOGGER.warning("dropped unsafe market observation: %s", exc)
+            upstream_age = (
+                None
+                if item.upstream_received_epoch is None
+                else item.upstream_received_epoch - item.event_epoch
+            )
+            LOGGER.warning(
+                "dropped unsafe market observation: source=%s local_age=%.3fs "
+                "upstream_age=%s reason=%s",
+                item.source,
+                item.received_epoch - item.event_epoch,
+                "n/a" if upstream_age is None else f"{upstream_age:.3f}s",
+                exc,
+            )
             return False
         if self.on_observation is not None:
             self.on_observation(item)

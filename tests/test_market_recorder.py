@@ -42,6 +42,17 @@ def test_newer_sequence_allows_source_timestamp_regression(tmp_path):
     assert len(path.read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_upstream_receive_time_avoids_local_clock_false_staleness(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(
+        event_epoch=100.0,
+        upstream_received_epoch=100.1,
+        received_epoch=110.0,
+    ))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_recorder_has_no_execution_surface(tmp_path):
     recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
     forbidden = {"buy", "sell", "place_order", "execute_position"}

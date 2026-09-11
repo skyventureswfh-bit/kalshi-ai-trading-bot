@@ -92,11 +92,21 @@ class JsonlMarketRecorder:
         numeric = (item.received_epoch, item.event_epoch, item.target, item.seconds_remaining)
         if not all(isfinite(value) for value in numeric):
             raise UnsafeObservation("non-finite observation value")
+        if (item.upstream_received_epoch is not None
+                and not isfinite(item.upstream_received_epoch)):
+            raise UnsafeObservation("non-finite upstream receive time")
         if not item.source or not item.ticker:
             raise UnsafeObservation("source and ticker are required")
-        if item.received_epoch < item.event_epoch:
+        # Prefer Kalshi's own receipt timestamp when the channel supplies it.
+        # This measures feed latency without depending on the laptop clock.
+        freshness_epoch = (
+            item.upstream_received_epoch
+            if item.upstream_received_epoch is not None
+            else item.received_epoch
+        )
+        if freshness_epoch < item.event_epoch:
             raise UnsafeObservation("received time precedes event time")
-        if item.received_epoch - item.event_epoch > self.max_staleness_seconds:
+        if freshness_epoch - item.event_epoch > self.max_staleness_seconds:
             raise UnsafeObservation("stale observation")
         previous_event = self._last_event_by_source.get(item.source)
         previous_sequence = self._last_sequence_by_source.get(item.source)
