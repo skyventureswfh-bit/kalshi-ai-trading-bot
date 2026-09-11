@@ -34,6 +34,13 @@ jobs:
             src/auto/intent_ledger.py \
             src/auto/kill_switch.py \
             src/auto/runner.py \
+            src/auto/settlement_math.py \
+            src/auto/market_recorder.py \
+            src/auto/kalshi_feed_parser.py \
+            src/auto/observation_listener.py \
+            src/auto/session_replay.py \
+            src/auto/capture_session.py \
+            src/auto/market_discovery.py \
             src/clients/openrouter_cost_guard.py \
             src/config/settings.py \
             src/jobs/execute.py \
@@ -51,4 +58,11 @@ jobs:
             tests/test_auto_idempotency.py \
             tests/test_auto_kill_switch.py \
             tests/test_auto_runner.py \
-            tests/test_auto_openrouter_circuit_breaker.py
+            tests/test_auto_openrouter_circuit_breaker.py \
+            tests/test_settlement_math.py \
+            tests/test_market_recorder.py \
+            tests/test_kalshi_feed_parser.py \
+            tests/test_observation_listener.py \
+            tests/test_session_replay.py \
+            tests/test_capture_session.py \
+            tests/test_market_discovery.py
