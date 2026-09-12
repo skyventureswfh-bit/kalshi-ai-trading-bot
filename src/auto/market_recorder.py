@@ -36,9 +36,16 @@ class MarketObservation:
 class JsonlMarketRecorder:
     """Validate and durably append observations as newline-delimited JSON."""
 
-    def __init__(self, path: str, *, max_staleness_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_staleness_seconds: float = 2.0,
+        local_clock_tolerance_seconds: float = 0.5,
+    ) -> None:
         self.path = Path(path)
         self.max_staleness_seconds = max_staleness_seconds
+        self.local_clock_tolerance_seconds = local_clock_tolerance_seconds
         self._last_event_by_source: Dict[str, float] = {}
         self._last_sequence_by_source: Dict[str, int] = {}
 
@@ -106,7 +113,13 @@ class JsonlMarketRecorder:
         )
         if freshness_epoch < item.event_epoch:
             raise UnsafeObservation("received time precedes event time")
-        if freshness_epoch - item.event_epoch > self.max_staleness_seconds:
+        allowed_staleness = self.max_staleness_seconds
+        if item.upstream_received_epoch is None:
+            # Order-book frames have no Kalshi receipt timestamp, so their age
+            # depends on the laptop clock.  Allow only a small measured clock
+            # tolerance; strategy cross-source synchronization remains strict.
+            allowed_staleness += self.local_clock_tolerance_seconds
+        if freshness_epoch - item.event_epoch > allowed_staleness:
             raise UnsafeObservation("stale observation")
         previous_event = self._last_event_by_source.get(item.source)
         previous_sequence = self._last_sequence_by_source.get(item.source)

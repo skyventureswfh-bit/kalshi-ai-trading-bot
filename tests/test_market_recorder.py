@@ -53,6 +53,19 @@ def test_upstream_receive_time_avoids_local_clock_false_staleness(tmp_path):
     assert len(path.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_orderbook_allows_measured_local_clock_tolerance(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(event_epoch=100.0, received_epoch=102.01))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_orderbook_still_rejects_beyond_local_clock_tolerance(tmp_path):
+    recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
+    with pytest.raises(UnsafeObservation, match="stale"):
+        recorder.record(_observation(event_epoch=100.0, received_epoch=102.51))
+
+
 def test_recorder_has_no_execution_surface(tmp_path):
     recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
     forbidden = {"buy", "sell", "place_order", "execute_position"}
