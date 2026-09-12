@@ -1,4 +1,4 @@
-"""Command-line launcher for one read-only BTC 15-minute capture session."""
+"""Command-line launcher for read-only BTC 15-minute capture sessions."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _expiration_epoch(value: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Capture one Kalshi BTC market; never trade")
+    parser = argparse.ArgumentParser(description="Capture Kalshi BTC markets; never trade")
     parser.add_argument("--series", default="KXBTC15M")
     parser.add_argument("--ticker")
     parser.add_argument("--target", type=float)
@@ -56,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the locked Wave strategy against the read-only live feed; never trade",
     )
     parser.add_argument("--wave-journal", help="Optional Wave decision/result JSONL path")
+    parser.add_argument(
+        "--rounds", type=int, default=1,
+        help="Number of consecutive markets to capture (default: 1; maximum: 96)",
+    )
     return parser
 
 
@@ -129,9 +133,91 @@ async def capture(args: argparse.Namespace) -> dict:
     return result
 
 
+def _validate_rounds(args: argparse.Namespace) -> int:
+    rounds = int(getattr(args, "rounds", 1))
+    if not 1 <= rounds <= 96:
+        raise RuntimeError("rounds must be between 1 and 96")
+    if rounds > 1 and any((args.ticker, args.target, args.expires)):
+        raise RuntimeError("multiple rounds require automatic market discovery")
+    if rounds > 1 and (args.output or args.wave_journal):
+        raise RuntimeError("custom output paths are supported only for one round")
+    return rounds
+
+
+def _campaign_summary(results: list[dict], requested_rounds: int) -> dict:
+    markets = []
+    trades = wins = losses = 0
+    quote_observations = dropped_observations = 0
+    net_pnl = fees = slippage = 0.0
+    net_wins = net_losses = 0.0
+    for result in results:
+        score = result.get("wave_paper") or {}
+        safety = result.get("feed_safety") or {}
+        round_trades = int(score.get("trades") or 0)
+        round_wins = int(score.get("wins") or 0)
+        round_losses = int(score.get("losses") or 0)
+        trades += round_trades
+        wins += round_wins
+        losses += round_losses
+        round_quotes = int(result.get("quote_observations") or 0)
+        round_dropped = int(safety.get("dropped_observations") or 0)
+        quote_observations += round_quotes
+        dropped_observations += round_dropped
+        net_pnl += float(score.get("net_pnl_dollars") or 0.0)
+        fees += float(score.get("total_fees_dollars") or 0.0)
+        slippage += float(score.get("total_slippage_dollars") or 0.0)
+        net_wins += float(score.get("average_net_win_dollars") or 0.0) * round_wins
+        net_losses += float(score.get("average_net_loss_dollars") or 0.0) * round_losses
+        markets.append({
+            "ticker": result.get("ticker"),
+            "result": result.get("result"),
+            "quote_observations": round_quotes,
+            "dropped_observations": round_dropped,
+            "trades": round_trades,
+            "wins": round_wins,
+            "losses": round_losses,
+            "net_pnl_dollars": float(score.get("net_pnl_dollars") or 0.0),
+        })
+    return {
+        "requested_rounds": requested_rounds,
+        "completed_rounds": len(results),
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / trades if trades else 0.0,
+        "average_net_win_dollars": net_wins / wins if wins else 0.0,
+        "average_net_loss_dollars": net_losses / losses if losses else 0.0,
+        "total_fees_dollars": fees,
+        "total_slippage_dollars": slippage,
+        "net_pnl_dollars": net_pnl,
+        "quote_observations": quote_observations,
+        "dropped_observations": dropped_observations,
+        "markets": markets,
+    }
+
+
+async def capture_rounds(args: argparse.Namespace) -> dict:
+    rounds = _validate_rounds(args)
+    if rounds == 1:
+        return await capture(args)
+    results = []
+    for number in range(1, rounds + 1):
+        result = await capture(args)
+        results.append(result)
+        score = result.get("wave_paper") or {}
+        print(
+            f"PAPER ROUND {number}/{rounds} complete: {result.get('ticker')} "
+            f"result={result.get('result')} trades={score.get('trades', 0)} "
+            f"net=${float(score.get('net_pnl_dollars') or 0.0):.2f}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return {"paper_campaign": _campaign_summary(results, rounds)}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    print(json.dumps(asyncio.run(capture(args)), indent=2, sort_keys=True))
+    print(json.dumps(asyncio.run(capture_rounds(args)), indent=2, sort_keys=True))
     return 0
 
 
