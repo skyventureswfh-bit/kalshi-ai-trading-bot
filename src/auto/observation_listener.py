@@ -1,6 +1,6 @@
 """Authenticated, read-only Kalshi WebSocket listener for Beast observations.
 
-Only the documented orderbook and CF Benchmarks channels are subscribed.
+Only the documented market-ticker and CF Benchmarks channels are subscribed.
 There are deliberately no portfolio, order, fill, buy, or sell operations.
 """
 
@@ -17,6 +17,7 @@ from src.auto.kalshi_feed_parser import (
     LiveOrderBook,
     OrderBookDesynchronized,
     parse_cfbenchmarks_value,
+    parse_market_ticker,
     parse_orderbook_snapshot,
 )
 from src.auto.market_recorder import JsonlMarketRecorder, MarketObservation, UnsafeObservation
@@ -78,7 +79,7 @@ class ObservationListener:
     def subscription_commands(ticker: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         return (
             {"id": 1, "cmd": "subscribe", "params": {
-                "channels": ["orderbook_delta"], "market_ticker": ticker}},
+                "channels": ["ticker"], "market_ticker": ticker}},
             {"id": 2, "cmd": "subscribe", "params": {
                 "channels": ["cfbenchmarks_value"], "index_ids": ["BRTI"]}},
         )
@@ -153,6 +154,11 @@ class ObservationListener:
             item = parse_cfbenchmarks_value(
                 frame, ticker=self.config.ticker, target=self.config.target,
                 seconds_remaining=seconds_remaining, local_received_epoch=aligned_received_epoch,
+            )
+        elif frame_type == "ticker":
+            item = parse_market_ticker(
+                frame, ticker=self.config.ticker, target=self.config.target,
+                seconds_remaining=seconds_remaining, received_epoch=aligned_received_epoch,
             )
         elif frame_type == "orderbook_snapshot":
             self._orderbook.load_snapshot(frame)

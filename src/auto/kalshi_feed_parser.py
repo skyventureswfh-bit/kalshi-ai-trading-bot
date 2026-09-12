@@ -122,6 +122,50 @@ def parse_orderbook_snapshot(
     )
 
 
+def parse_market_ticker(
+    frame: Dict[str, Any], *, ticker: str, target: float, seconds_remaining: float,
+    received_epoch: float,
+) -> MarketObservation:
+    """Parse Kalshi's top-of-book ticker update.
+
+    Wave needs executable best bids and asks, not full book depth.  The ticker
+    channel supplies those prices directly and carries an exchange timestamp.
+    """
+    if frame.get("type") != "ticker":
+        raise UnsafeObservation("unexpected market ticker frame type")
+    msg = frame.get("msg") or {}
+    if str(msg.get("market_ticker")) != ticker:
+        raise UnsafeObservation("market ticker mismatch")
+    yes_bid = _dollars_to_cents(msg.get("yes_bid_dollars"))
+    yes_ask = _dollars_to_cents(msg.get("yes_ask_dollars"))
+    no_bid = None if yes_ask is None else 100.0 - yes_ask
+    no_ask = None if yes_bid is None else 100.0 - yes_bid
+    timestamp_ms = msg.get("ts_ms")
+    if timestamp_ms is None:
+        raise UnsafeObservation("market ticker timestamp missing")
+    sequence = frame.get("seq")
+    return MarketObservation(
+        event_epoch=float(timestamp_ms) / 1000.0,
+        received_epoch=received_epoch,
+        upstream_received_epoch=None,
+        source="kalshi_ticker",
+        ticker=ticker,
+        target=target,
+        seconds_remaining=seconds_remaining,
+        yes_bid_cents=yes_bid,
+        yes_ask_cents=yes_ask,
+        no_bid_cents=no_bid,
+        no_ask_cents=no_ask,
+        sequence=None if sequence is None else int(sequence),
+    )
+
+
+def _dollars_to_cents(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    return float(Decimal(str(value)) * Decimal("100"))
+
+
 def _top_of_book(msg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     yes_levels = msg.get("yes_dollars_fp") or []
     no_levels = msg.get("no_dollars_fp") or []

@@ -62,7 +62,7 @@ class WavePaperSession:
             if self._brti is not None and item.event_epoch < self._brti.event_epoch:
                 return None
             self._brti = item
-        elif item.source == "kalshi_orderbook":
+        elif item.source in {"kalshi_ticker", "kalshi_orderbook"}:
             if self._book is not None and item.event_epoch < self._book.event_epoch:
                 return None
             self._book = item

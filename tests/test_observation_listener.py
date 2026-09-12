@@ -37,11 +37,26 @@ def test_auth_signs_documented_websocket_path(tmp_path):
 def test_subscribes_only_to_observation_channels(tmp_path):
     listener, _ = _listener(tmp_path)
     serialized = json.dumps(listener.subscription_commands("KXBTC15M-TEST"))
-    assert "orderbook_delta" in serialized
+    assert "ticker" in serialized
+    assert "orderbook_delta" not in serialized
     assert "cfbenchmarks_value" in serialized
     assert "BRTI" in serialized
     for forbidden in ("portfolio", "fill", "buy", "sell"):
         assert forbidden not in serialized
+
+
+def test_processes_market_ticker_into_recorder(tmp_path):
+    listener, _ = _listener(tmp_path)
+    frame = {
+        "type": "ticker", "sid": 7,
+        "msg": {"market_ticker": "KXBTC15M-TEST",
+                "yes_bid_dollars": "0.5800", "yes_ask_dollars": "0.6100",
+                "ts_ms": 1710000000100},
+    }
+    assert listener.process_frame(frame, local_received_epoch=1710000000.2)
+    saved = json.loads(listener.recorder.path.read_text())
+    assert saved["source"] == "kalshi_ticker"
+    assert saved["yes_ask_cents"] == 61
 
 
 def test_processes_cf_frame_into_recorder(tmp_path):

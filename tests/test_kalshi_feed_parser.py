@@ -1,6 +1,11 @@
 import pytest
 
-from src.auto.kalshi_feed_parser import LiveOrderBook, parse_cfbenchmarks_value, parse_orderbook_snapshot
+from src.auto.kalshi_feed_parser import (
+    LiveOrderBook,
+    parse_cfbenchmarks_value,
+    parse_market_ticker,
+    parse_orderbook_snapshot,
+)
 from src.auto.market_recorder import UnsafeObservation
 
 
@@ -30,6 +35,23 @@ def test_orderbook_converts_opposite_bid_to_ask():
     assert item.yes_ask_cents == 51
     assert item.no_bid_cents == 49
     assert item.no_ask_cents == 52
+
+
+def test_market_ticker_provides_executable_top_of_book():
+    frame = {"type": "ticker", "sid": 7,
+             "msg": {"market_ticker": "KXBTC15M-TEST",
+                     "yes_bid_dollars": "0.5800", "yes_ask_dollars": "0.6100",
+                     "ts_ms": 1710000000300}}
+    item = parse_market_ticker(
+        frame, ticker="KXBTC15M-TEST", target=68001,
+        seconds_remaining=46, received_epoch=1710000000.4,
+    )
+    assert item.source == "kalshi_ticker"
+    assert item.event_epoch == 1710000000.3
+    assert item.yes_bid_cents == 58
+    assert item.yes_ask_cents == 61
+    assert item.no_bid_cents == 39
+    assert item.no_ask_cents == 42
 
 
 def test_live_book_applies_delta_and_rejects_sequence_gap():
