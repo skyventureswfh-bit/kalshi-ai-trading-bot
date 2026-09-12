@@ -21,6 +21,8 @@ class ReplaySummary:
     result: str
     brti_observations: int
     orderbook_observations: int
+    ticker_observations: int
+    quote_observations: int
     first_yes_mid_cents: float | None
     last_yes_mid_cents: float | None
 
@@ -38,13 +40,18 @@ def summarize_capture(path: str) -> ReplaySummary:
 
     brti = [row for row in rows if row.get("brti") is not None]
     books = [row for row in rows if row.get("source") == "kalshi_orderbook"]
+    tickers = [row for row in rows if row.get("source") == "kalshi_ticker"]
+    quotes = [
+        row for row in rows
+        if row.get("source") in {"kalshi_orderbook", "kalshi_ticker"}
+    ]
     complete = [row for row in brti if (row.get("official_average_window_size") or 0) >= 60]
     if not complete:
         raise IncompleteCapture("missing official 60-sample final-minute average")
     final = complete[-1]
     target = float(final["target"])
     average = float(final["official_final_minute_average"])
-    mids = [_yes_mid(row) for row in books]
+    mids = [_yes_mid(row) for row in quotes]
     mids = [value for value in mids if value is not None]
     return ReplaySummary(
         ticker=str(final["ticker"]),
@@ -54,6 +61,8 @@ def summarize_capture(path: str) -> ReplaySummary:
         result="UP" if average > target else "DOWN" if average < target else "TIE",
         brti_observations=len(brti),
         orderbook_observations=len(books),
+        ticker_observations=len(tickers),
+        quote_observations=len(quotes),
         first_yes_mid_cents=mids[0] if mids else None,
         last_yes_mid_cents=mids[-1] if mids else None,
     )
@@ -65,4 +74,3 @@ def _yes_mid(row: Dict[str, Any]) -> float | None:
     if bid is None or ask is None:
         return None
     return (float(bid) + float(ask)) / 2.0
-
