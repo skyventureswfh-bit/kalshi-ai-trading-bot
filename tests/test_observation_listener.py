@@ -56,7 +56,7 @@ def test_processes_cf_frame_into_recorder(tmp_path):
     assert listener.process_frame(frame, local_received_epoch=1710000000.2) is True
     saved = json.loads(listener.recorder.path.read_text())
     assert saved["official_final_minute_average"] == 68000.23
-    assert saved["seconds_remaining"] == pytest.approx(59.8)
+    assert saved["seconds_remaining"] == pytest.approx(59.859)
 
 
 def test_complete_official_window_stops_session(tmp_path):
@@ -85,3 +85,25 @@ def test_fresh_snapshot_resets_orderbook_sequence_epoch(tmp_path):
     assert listener.process_frame(first, local_received_epoch=1710000000.2)
     assert listener.process_frame(fresh, local_received_epoch=1710000000.3)
     assert len(listener.recorder.path.read_text().splitlines()) == 2
+
+
+def test_cf_clock_calibrates_orderbook_receive_time(tmp_path):
+    listener, _ = _listener(tmp_path)
+    cf = {
+        "type": "cfbenchmarks_value", "seq": 42,
+        "msg": {"index_id": "BRTI", "received_at": 1710000000141,
+                "data": '{"time":1710000000123,"value":"68000.12"}'},
+    }
+    snapshot = {
+        "type": "orderbook_snapshot", "sid": 2, "seq": 2,
+        "msg": {"market_ticker": "KXBTC15M-TEST",
+                "yes_dollars_fp": [["0.4800", "10"]],
+                "no_dollars_fp": [["0.4900", "8"]]},
+    }
+    # The laptop clock is 2.5 seconds ahead of Kalshi's receipt clock.
+    assert listener.process_frame(cf, local_received_epoch=1710000002.641)
+    assert listener.server_clock_offset_seconds == pytest.approx(2.5)
+    assert listener.process_frame(snapshot, local_received_epoch=1710000002.741)
+    saved = [json.loads(line) for line in listener.recorder.path.read_text().splitlines()]
+    assert saved[-1]["received_epoch"] == pytest.approx(1710000000.241)
+    assert saved[-1]["seconds_remaining"] == pytest.approx(59.759)

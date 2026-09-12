@@ -61,6 +61,7 @@ class ObservationListener:
         self.dropped_observations = 0
         self.orderbook_resyncs = 0
         self.last_rejection_reason: Optional[str] = None
+        self.server_clock_offset_seconds: Optional[float] = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -131,25 +132,40 @@ class ObservationListener:
                 delay = min(delay * 2, self.config.reconnect_max_seconds)
 
     def process_frame(self, frame: Dict[str, Any], *, local_received_epoch: float) -> bool:
-        seconds_remaining = max(0.0, self.config.expiration_epoch - local_received_epoch)
         frame_type = frame.get("type")
+        if frame_type == "cfbenchmarks_value":
+            msg = frame.get("msg") or {}
+            upstream_received = float(msg["received_at"]) / 1000.0
+            offset_sample = local_received_epoch - upstream_received
+            # Network transit is positive, so the smallest observed sample is
+            # the safest estimate of the laptop's wall-clock offset.
+            if abs(offset_sample) <= 300.0:
+                self.server_clock_offset_seconds = (
+                    offset_sample
+                    if self.server_clock_offset_seconds is None
+                    else min(self.server_clock_offset_seconds, offset_sample)
+                )
+        aligned_received_epoch = local_received_epoch
+        if self.server_clock_offset_seconds is not None:
+            aligned_received_epoch -= self.server_clock_offset_seconds
+        seconds_remaining = max(0.0, self.config.expiration_epoch - aligned_received_epoch)
         if frame_type == "cfbenchmarks_value":
             item = parse_cfbenchmarks_value(
                 frame, ticker=self.config.ticker, target=self.config.target,
-                seconds_remaining=seconds_remaining, local_received_epoch=local_received_epoch,
+                seconds_remaining=seconds_remaining, local_received_epoch=aligned_received_epoch,
             )
         elif frame_type == "orderbook_snapshot":
             self._orderbook.load_snapshot(frame)
             self.recorder.reset_source_ordering("kalshi_orderbook")
             item = parse_orderbook_snapshot(
                 frame, target=self.config.target, seconds_remaining=seconds_remaining,
-                received_epoch=local_received_epoch,
+                received_epoch=aligned_received_epoch,
             )
         elif frame_type == "orderbook_delta":
             event_epoch = self._orderbook.apply_delta(frame)
             yes_bid, yes_ask, no_bid, no_ask = self._orderbook.top()
             item = MarketObservation(
-                received_epoch=local_received_epoch,
+                received_epoch=aligned_received_epoch,
                 event_epoch=event_epoch,
                 upstream_received_epoch=None,
                 source="kalshi_orderbook",
@@ -182,7 +198,7 @@ class ObservationListener:
                 else item.upstream_received_epoch - item.event_epoch
             )
             LOGGER.warning(
-                "dropped unsafe market observation: source=%s local_age=%.3fs "
+                "dropped unsafe market observation: source=%s receive_age=%.3fs "
                 "upstream_age=%s reason=%s",
                 item.source,
                 item.received_epoch - item.event_epoch,

@@ -121,6 +121,7 @@ async def capture(args: argparse.Namespace) -> dict:
         "dropped_observations": listener.dropped_observations,
         "orderbook_resyncs": listener.orderbook_resyncs,
         "last_rejection_reason": listener.last_rejection_reason,
+        "server_clock_offset_seconds": listener.server_clock_offset_seconds,
     }
     if wave_session is not None:
         result["wave_paper"] = asdict(wave_session.scorecard)
