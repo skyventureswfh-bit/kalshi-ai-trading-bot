@@ -1744,13 +1744,32 @@ def cmd_safety_status(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_observe_btc(args: argparse.Namespace) -> None:
-    """Capture one BTC 15-minute market without exposing a trading path."""
+    """Capture BTC 15-minute markets without exposing a trading path."""
     from src.auto.capture_session import main as capture_main
 
     capture_args = ["--series", args.series]
     if args.output:
         capture_args.extend(["--output", args.output])
+    if args.wave_paper:
+        capture_args.append("--wave-paper")
+    if args.wave_journal:
+        capture_args.extend(["--wave-journal", args.wave_journal])
+    capture_args.extend(["--rounds", str(args.rounds)])
     capture_main(capture_args)
+
+
+def cmd_replay_wave(args: argparse.Namespace) -> None:
+    """Replay saved BTC observations through Wave without network or orders."""
+    import json
+
+    from src.auto.wave_replay import discover_captures, replay_campaign
+
+    paths = discover_captures(args.directory)
+    if args.limit is not None:
+        if args.limit < 1:
+            raise ValueError("limit must be at least 1")
+        paths = paths[-args.limit:]
+    print(json.dumps(replay_campaign(paths), indent=2, sort_keys=True))
 
 
 def cmd_auto(args: argparse.Namespace) -> None:
@@ -2101,7 +2120,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- observe-btc ---
     p_observe = subparsers.add_parser(
         "observe-btc",
-        help="Record one BTC 15-minute market without trading",
+        help="Record BTC 15-minute markets without trading",
         description=(
             "Auto-discover the current KXBTC15M market, record the order book "
             "and official CF Benchmarks settlement feed, then stop after the "
@@ -2114,7 +2133,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_observe.add_argument(
         "--output", default=None, help="Optional JSONL output path"
     )
+    p_observe.add_argument(
+        "--wave-paper",
+        action="store_true",
+        help="Run the locked Wave strategy on the live read-only feed; never place orders",
+    )
+    p_observe.add_argument(
+        "--wave-journal", default=None, help="Optional Wave decision/result JSONL path"
+    )
+    p_observe.add_argument(
+        "--rounds", type=int, default=1,
+        help="Consecutive markets to capture (default: 1; maximum: 96)",
+    )
     p_observe.set_defaults(func=cmd_observe_btc)
+
+    # --- replay-wave ---
+    p_wave_replay = subparsers.add_parser(
+        "replay-wave",
+        help="Replay saved BTC Wave rounds offline; never place orders",
+        description=(
+            "Run the locked Wave paper strategy over saved Beast observation "
+            "files and print an aggregate evidence scorecard. This command "
+            "does not connect to Kalshi and cannot place orders."
+        ),
+    )
+    p_wave_replay.add_argument(
+        "--directory", default="data/beast_observations",
+        help="Capture directory (default: data/beast_observations)",
+    )
+    p_wave_replay.add_argument(
+        "--limit", type=int, default=None,
+        help="Replay only the newest N capture files",
+    )
+    p_wave_replay.set_defaults(func=cmd_replay_wave)
 
     # --- auto ---
     p_auto = subparsers.add_parser(

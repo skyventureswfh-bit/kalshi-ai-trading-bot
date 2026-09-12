@@ -1,6 +1,11 @@
 import pytest
 
-from src.auto.kalshi_feed_parser import LiveOrderBook, parse_cfbenchmarks_value, parse_orderbook_snapshot
+from src.auto.kalshi_feed_parser import (
+    LiveOrderBook,
+    parse_cfbenchmarks_value,
+    parse_market_ticker,
+    parse_orderbook_snapshot,
+)
 from src.auto.market_recorder import UnsafeObservation
 
 
@@ -32,6 +37,23 @@ def test_orderbook_converts_opposite_bid_to_ask():
     assert item.no_ask_cents == 52
 
 
+def test_market_ticker_provides_executable_top_of_book():
+    frame = {"type": "ticker", "sid": 7,
+             "msg": {"market_ticker": "KXBTC15M-TEST",
+                     "yes_bid_dollars": "0.5800", "yes_ask_dollars": "0.6100",
+                     "ts_ms": 1710000000300}}
+    item = parse_market_ticker(
+        frame, ticker="KXBTC15M-TEST", target=68001,
+        seconds_remaining=46, received_epoch=1710000000.4,
+    )
+    assert item.source == "kalshi_ticker"
+    assert item.event_epoch == 1710000000.3
+    assert item.yes_bid_cents == 58
+    assert item.yes_ask_cents == 61
+    assert item.no_bid_cents == 39
+    assert item.no_ask_cents == 42
+
+
 def test_live_book_applies_delta_and_rejects_sequence_gap():
     book = LiveOrderBook()
     book.load_snapshot({"type": "orderbook_snapshot", "sid": 2, "seq": 2,
@@ -49,3 +71,20 @@ def test_live_book_applies_delta_and_rejects_sequence_gap():
                           "msg": {"market_ticker": "KXBTC15M-TEST",
                                   "price_dollars": "0.5100", "delta_fp": "1",
                                   "side": "yes", "ts_ms": 1710000000400}})
+
+
+def test_live_book_uses_exact_fixed_point_quantities():
+    book = LiveOrderBook()
+    book.load_snapshot({"type": "orderbook_snapshot", "sid": 2, "seq": 2,
+                        "msg": {"market_ticker": "KXBTC15M-TEST",
+                                "yes_dollars_fp": [["0.4800", "0.30"]],
+                                "no_dollars_fp": []}})
+    book.apply_delta({"type": "orderbook_delta", "sid": 2, "seq": 3,
+                      "msg": {"market_ticker": "KXBTC15M-TEST",
+                              "price_dollars": "0.4800", "delta_fp": "-0.10",
+                              "side": "yes", "ts_ms": 1710000000300}})
+    book.apply_delta({"type": "orderbook_delta", "sid": 2, "seq": 4,
+                      "msg": {"market_ticker": "KXBTC15M-TEST",
+                              "price_dollars": "0.4800", "delta_fp": "-0.20",
+                              "side": "yes", "ts_ms": 1710000000400}})
+    assert book.top() == (None, None, None, None)

@@ -27,6 +27,26 @@ def test_replay_reports_result_margin_and_book_movement(tmp_path):
     result = summarize_capture(str(path))
     assert result.result == "UP"
     assert result.official_margin == 1.25
+    assert result.orderbook_observations == 2
+    assert result.ticker_observations == 0
+    assert result.quote_observations == 2
     assert result.first_yes_mid_cents == 40
     assert result.last_yes_mid_cents == 80
 
+
+def test_replay_reports_ticker_quotes_after_source_switch(tmp_path):
+    path = tmp_path / "capture.jsonl"
+    rows = [
+        {"source": "kalshi_ticker", "yes_bid_cents": 58, "yes_ask_cents": 60},
+        {"source": "kalshi_ticker", "yes_bid_cents": 88, "yes_ask_cents": 90},
+        {"source": "kalshi_cfbenchmarks_brti", "ticker": "KX", "target": 100,
+         "brti": 102, "official_average_window_size": 60,
+         "official_final_minute_average": 101.25},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    result = summarize_capture(str(path))
+    assert result.orderbook_observations == 0
+    assert result.ticker_observations == 2
+    assert result.quote_observations == 2
+    assert result.first_yes_mid_cents == 59
+    assert result.last_yes_mid_cents == 89

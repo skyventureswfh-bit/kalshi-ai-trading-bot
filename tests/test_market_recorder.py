@@ -30,14 +30,78 @@ def test_recorder_rejects_stale_or_reordered_data_without_appending(tmp_path):
     with pytest.raises(UnsafeObservation, match="stale"):
         recorder.record(_observation(event_epoch=101.0, received_epoch=104.0, sequence=2))
     with pytest.raises(UnsafeObservation, match="out-of-order"):
-        recorder.record(_observation(event_epoch=99.0, received_epoch=99.1, sequence=2))
+        recorder.record(_observation(event_epoch=99.0, received_epoch=99.1, sequence=None))
     assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_newer_sequence_allows_source_timestamp_regression(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation())
+    recorder.record(_observation(event_epoch=100.0, received_epoch=100.3, sequence=2))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_upstream_receive_time_avoids_local_clock_false_staleness(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(
+        event_epoch=100.0,
+        upstream_received_epoch=100.1,
+        received_epoch=110.0,
+    ))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_orderbook_allows_measured_local_clock_tolerance(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(event_epoch=100.0, received_epoch=102.01))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_orderbook_still_rejects_beyond_local_clock_tolerance(tmp_path):
+    recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
+    with pytest.raises(UnsafeObservation, match="stale"):
+        recorder.record(_observation(event_epoch=100.0, received_epoch=102.51))
+
+
+def test_local_clock_jitter_may_put_event_slightly_ahead(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(event_epoch=100.204, received_epoch=100.2))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_local_event_too_far_in_future_is_rejected(tmp_path):
+    recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
+    with pytest.raises(UnsafeObservation, match="precedes event time"):
+        recorder.record(_observation(event_epoch=100.71, received_epoch=100.2))
+
+
+def test_upstream_receipt_must_not_precede_event(tmp_path):
+    recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
+    with pytest.raises(UnsafeObservation, match="precedes event time"):
+        recorder.record(_observation(
+            event_epoch=100.2,
+            upstream_received_epoch=100.199,
+            received_epoch=100.3,
+        ))
 
 
 def test_recorder_has_no_execution_surface(tmp_path):
     recorder = JsonlMarketRecorder(str(tmp_path / "observations.jsonl"))
     forbidden = {"buy", "sell", "place_order", "execute_position"}
     assert forbidden.isdisjoint(dir(recorder))
+
+
+def test_authoritative_snapshot_can_reset_source_sequence(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    recorder = JsonlMarketRecorder(str(path))
+    recorder.record(_observation(sequence=10))
+    recorder.reset_source_ordering("kalshi")
+    recorder.record(_observation(event_epoch=101.0, received_epoch=101.1, sequence=2))
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_synchronized_pair_enforces_cross_source_skew(tmp_path):

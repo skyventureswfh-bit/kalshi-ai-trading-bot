@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
 from src.auto.market_recorder import MarketObservation, UnsafeObservation
+
+
+class OrderBookDesynchronized(UnsafeObservation):
+    """The incremental book is unsafe until a fresh snapshot is received."""
 
 
 class LiveOrderBook:
@@ -15,8 +20,10 @@ class LiveOrderBook:
         self.ticker: Optional[str] = None
         self.sid: Optional[int] = None
         self.sequence: Optional[int] = None
-        self.yes: Dict[float, float] = {}
-        self.no: Dict[float, float] = {}
+        # Kalshi sends fixed-point decimal strings.  Keep them exact internally;
+        # binary floats can turn 0.3 - 0.1 - 0.2 into a tiny negative quantity.
+        self.yes: Dict[Decimal, Decimal] = {}
+        self.no: Dict[Decimal, Decimal] = {}
 
     def load_snapshot(self, frame: Dict[str, Any]) -> None:
         if frame.get("type") != "orderbook_snapshot":
@@ -30,23 +37,23 @@ class LiveOrderBook:
 
     def apply_delta(self, frame: Dict[str, Any]) -> float:
         if self.sequence is None:
-            raise UnsafeObservation("orderbook delta received before snapshot")
+            raise OrderBookDesynchronized("orderbook delta received before snapshot")
         if frame.get("type") != "orderbook_delta" or int(frame["sid"]) != self.sid:
-            raise UnsafeObservation("orderbook delta stream mismatch")
+            raise OrderBookDesynchronized("orderbook delta stream mismatch")
         sequence = int(frame["seq"])
         if sequence != self.sequence + 1:
-            raise UnsafeObservation("orderbook sequence gap")
+            raise OrderBookDesynchronized("orderbook sequence gap")
         msg = frame.get("msg") or {}
         if str(msg["market_ticker"]) != self.ticker:
-            raise UnsafeObservation("orderbook delta market mismatch")
+            raise OrderBookDesynchronized("orderbook delta market mismatch")
         side = str(msg["side"]).lower()
         levels = self.yes if side == "yes" else self.no if side == "no" else None
         if levels is None:
-            raise UnsafeObservation("unknown orderbook side")
-        price = float(msg["price_dollars"]) * 100.0
-        quantity = levels.get(price, 0.0) + float(msg["delta_fp"])
+            raise OrderBookDesynchronized("unknown orderbook side")
+        price = Decimal(str(msg["price_dollars"])) * Decimal("100")
+        quantity = levels.get(price, Decimal("0")) + Decimal(str(msg["delta_fp"]))
         if quantity < 0:
-            raise UnsafeObservation("orderbook quantity became negative")
+            raise OrderBookDesynchronized("orderbook quantity became negative")
         if quantity == 0:
             levels.pop(price, None)
         else:
@@ -57,8 +64,12 @@ class LiveOrderBook:
     def top(self) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         yes_bid = max(self.yes, default=None)
         no_bid = max(self.no, default=None)
-        return (yes_bid, None if no_bid is None else 100.0 - no_bid,
-                no_bid, None if yes_bid is None else 100.0 - yes_bid)
+        return (
+            None if yes_bid is None else float(yes_bid),
+            None if no_bid is None else float(Decimal("100") - no_bid),
+            None if no_bid is None else float(no_bid),
+            None if yes_bid is None else float(Decimal("100") - yes_bid),
+        )
 
 
 def parse_cfbenchmarks_value(
@@ -111,6 +122,50 @@ def parse_orderbook_snapshot(
     )
 
 
+def parse_market_ticker(
+    frame: Dict[str, Any], *, ticker: str, target: float, seconds_remaining: float,
+    received_epoch: float,
+) -> MarketObservation:
+    """Parse Kalshi's top-of-book ticker update.
+
+    Wave needs executable best bids and asks, not full book depth.  The ticker
+    channel supplies those prices directly and carries an exchange timestamp.
+    """
+    if frame.get("type") != "ticker":
+        raise UnsafeObservation("unexpected market ticker frame type")
+    msg = frame.get("msg") or {}
+    if str(msg.get("market_ticker")) != ticker:
+        raise UnsafeObservation("market ticker mismatch")
+    yes_bid = _dollars_to_cents(msg.get("yes_bid_dollars"))
+    yes_ask = _dollars_to_cents(msg.get("yes_ask_dollars"))
+    no_bid = None if yes_ask is None else 100.0 - yes_ask
+    no_ask = None if yes_bid is None else 100.0 - yes_bid
+    timestamp_ms = msg.get("ts_ms")
+    if timestamp_ms is None:
+        raise UnsafeObservation("market ticker timestamp missing")
+    sequence = frame.get("seq")
+    return MarketObservation(
+        event_epoch=float(timestamp_ms) / 1000.0,
+        received_epoch=received_epoch,
+        upstream_received_epoch=None,
+        source="kalshi_ticker",
+        ticker=ticker,
+        target=target,
+        seconds_remaining=seconds_remaining,
+        yes_bid_cents=yes_bid,
+        yes_ask_cents=yes_ask,
+        no_bid_cents=no_bid,
+        no_ask_cents=no_ask,
+        sequence=None if sequence is None else int(sequence),
+    )
+
+
+def _dollars_to_cents(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    return float(Decimal(str(value)) * Decimal("100"))
+
+
 def _top_of_book(msg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     yes_levels = msg.get("yes_dollars_fp") or []
     no_levels = msg.get("no_dollars_fp") or []
@@ -121,6 +176,9 @@ def _top_of_book(msg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float],
     return yes_bid, yes_ask, no_bid, no_ask
 
 
-def _levels(rows: Any) -> Dict[float, float]:
-    return {float(price) * 100.0: float(quantity) for price, quantity in rows
-            if float(quantity) > 0}
+def _levels(rows: Any) -> Dict[Decimal, Decimal]:
+    return {
+        Decimal(str(price)) * Decimal("100"): Decimal(str(quantity))
+        for price, quantity in rows
+        if Decimal(str(quantity)) > 0
+    }

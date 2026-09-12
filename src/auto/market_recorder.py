@@ -36,9 +36,16 @@ class MarketObservation:
 class JsonlMarketRecorder:
     """Validate and durably append observations as newline-delimited JSON."""
 
-    def __init__(self, path: str, *, max_staleness_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_staleness_seconds: float = 2.0,
+        local_clock_tolerance_seconds: float = 0.5,
+    ) -> None:
         self.path = Path(path)
         self.max_staleness_seconds = max_staleness_seconds
+        self.local_clock_tolerance_seconds = local_clock_tolerance_seconds
         self._last_event_by_source: Dict[str, float] = {}
         self._last_sequence_by_source: Dict[str, int] = {}
 
@@ -51,7 +58,12 @@ class JsonlMarketRecorder:
             handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        self._last_event_by_source[observation.source] = observation.event_epoch
+        previous_event = self._last_event_by_source.get(observation.source)
+        self._last_event_by_source[observation.source] = (
+            observation.event_epoch
+            if previous_event is None
+            else max(previous_event, observation.event_epoch)
+        )
         if observation.sequence is not None:
             self._last_sequence_by_source[observation.source] = observation.sequence
 
@@ -74,21 +86,60 @@ class JsonlMarketRecorder:
         self.record(first)
         self.record(second)
 
+    def reset_source_ordering(self, source: str) -> None:
+        """Start a new authoritative stream epoch for one source.
+
+        WebSocket sequence numbers can restart after a reconnect.  A fresh
+        order-book snapshot is the boundary that makes that reset safe.
+        """
+        self._last_event_by_source.pop(source, None)
+        self._last_sequence_by_source.pop(source, None)
+
     def _validate(self, item: MarketObservation) -> None:
         numeric = (item.received_epoch, item.event_epoch, item.target, item.seconds_remaining)
         if not all(isfinite(value) for value in numeric):
             raise UnsafeObservation("non-finite observation value")
+        if (item.upstream_received_epoch is not None
+                and not isfinite(item.upstream_received_epoch)):
+            raise UnsafeObservation("non-finite upstream receive time")
         if not item.source or not item.ticker:
             raise UnsafeObservation("source and ticker are required")
-        if item.received_epoch < item.event_epoch:
+        # Prefer Kalshi's own receipt timestamp when the channel supplies it.
+        # This measures feed latency without depending on the laptop clock.
+        freshness_epoch = (
+            item.upstream_received_epoch
+            if item.upstream_received_epoch is not None
+            else item.received_epoch
+        )
+        # Channels without Kalshi's own receipt timestamp are compared with
+        # our calibrated wall clock.  A few milliseconds of scheduling and
+        # clock-estimation jitter can make an otherwise fresh exchange event
+        # appear slightly in the future.  Bound that allowance tightly; a
+        # larger lead is still unsafe.
+        future_tolerance = (
+            self.local_clock_tolerance_seconds
+            if item.upstream_received_epoch is None
+            else 0.0
+        )
+        if item.event_epoch - freshness_epoch > future_tolerance:
             raise UnsafeObservation("received time precedes event time")
-        if item.received_epoch - item.event_epoch > self.max_staleness_seconds:
+        allowed_staleness = self.max_staleness_seconds
+        if item.upstream_received_epoch is None:
+            # Order-book frames have no Kalshi receipt timestamp, so their age
+            # depends on the laptop clock.  Allow only a small measured clock
+            # tolerance; strategy cross-source synchronization remains strict.
+            allowed_staleness += self.local_clock_tolerance_seconds
+        if freshness_epoch - item.event_epoch > allowed_staleness:
             raise UnsafeObservation("stale observation")
         previous_event = self._last_event_by_source.get(item.source)
-        if previous_event is not None and item.event_epoch < previous_event:
+        previous_sequence = self._last_sequence_by_source.get(item.source)
+        # Kalshi can publish a newer sequenced frame whose embedded source time
+        # regresses slightly.  Sequence establishes message order; timestamp
+        # order is required only when no sequence proves the ordering.
+        if (previous_event is not None and item.event_epoch < previous_event
+                and (item.sequence is None or previous_sequence is None)):
             raise UnsafeObservation("out-of-order source timestamp")
         if item.sequence is not None:
-            previous_sequence = self._last_sequence_by_source.get(item.source)
             if previous_sequence is not None and item.sequence <= previous_sequence:
                 raise UnsafeObservation("duplicate or out-of-order source sequence")
         book_fields = ("yes_bid_cents", "yes_ask_cents", "no_bid_cents", "no_ask_cents")
