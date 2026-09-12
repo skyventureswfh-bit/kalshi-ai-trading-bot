@@ -111,7 +111,17 @@ class JsonlMarketRecorder:
             if item.upstream_received_epoch is not None
             else item.received_epoch
         )
-        if freshness_epoch < item.event_epoch:
+        # Channels without Kalshi's own receipt timestamp are compared with
+        # our calibrated wall clock.  A few milliseconds of scheduling and
+        # clock-estimation jitter can make an otherwise fresh exchange event
+        # appear slightly in the future.  Bound that allowance tightly; a
+        # larger lead is still unsafe.
+        future_tolerance = (
+            self.local_clock_tolerance_seconds
+            if item.upstream_received_epoch is None
+            else 0.0
+        )
+        if item.event_epoch - freshness_epoch > future_tolerance:
             raise UnsafeObservation("received time precedes event time")
         allowed_staleness = self.max_staleness_seconds
         if item.upstream_received_epoch is None:
