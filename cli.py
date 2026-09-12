@@ -1758,6 +1758,20 @@ def cmd_observe_btc(args: argparse.Namespace) -> None:
     capture_main(capture_args)
 
 
+def cmd_replay_wave(args: argparse.Namespace) -> None:
+    """Replay saved BTC observations through Wave without network or orders."""
+    import json
+
+    from src.auto.wave_replay import discover_captures, replay_campaign
+
+    paths = discover_captures(args.directory)
+    if args.limit is not None:
+        if args.limit < 1:
+            raise ValueError("limit must be at least 1")
+        paths = paths[-args.limit:]
+    print(json.dumps(replay_campaign(paths), indent=2, sort_keys=True))
+
+
 def cmd_auto(args: argparse.Namespace) -> None:
     """
     Beast Auto V1 — unattended supervisor around the existing live-trade
@@ -2132,6 +2146,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consecutive markets to capture (default: 1; maximum: 96)",
     )
     p_observe.set_defaults(func=cmd_observe_btc)
+
+    # --- replay-wave ---
+    p_wave_replay = subparsers.add_parser(
+        "replay-wave",
+        help="Replay saved BTC Wave rounds offline; never place orders",
+        description=(
+            "Run the locked Wave paper strategy over saved Beast observation "
+            "files and print an aggregate evidence scorecard. This command "
+            "does not connect to Kalshi and cannot place orders."
+        ),
+    )
+    p_wave_replay.add_argument(
+        "--directory", default="data/beast_observations",
+        help="Capture directory (default: data/beast_observations)",
+    )
+    p_wave_replay.add_argument(
+        "--limit", type=int, default=None,
+        help="Replay only the newest N capture files",
+    )
+    p_wave_replay.set_defaults(func=cmd_replay_wave)
 
     # --- auto ---
     p_auto = subparsers.add_parser(

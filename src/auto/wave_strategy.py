@@ -275,7 +275,21 @@ class WaveStrategy:
             return WaveDecision(WaveAction.WAIT, "too little time remains for a controlled exit")
         if len(history) < cfg.min_samples:
             return WaveDecision(WaveAction.WAIT, "collecting momentum samples")
-        recent = list(history[-max(cfg.min_samples, 8):])
+        # Feed cadence is not stable: BRTI and Kalshi quotes can each produce
+        # synchronized ticks, so a fixed "last eight" slice may cover only a
+        # few seconds.  Start with the minimum sample count, then extend just
+        # far enough backward to cover the locked confirmation span.  This
+        # preserves the time rail without making fast feeds impossible to
+        # trade.
+        start = max(0, len(history) - cfg.min_samples)
+        recent = list(history[start:])
+        while (
+            start > 0
+            and recent[-1].event_epoch - recent[0].event_epoch
+            < cfg.min_sample_span_seconds
+        ):
+            start -= 1
+            recent = list(history[start:])
         if recent[-1].event_epoch - recent[0].event_epoch < cfg.min_sample_span_seconds:
             return WaveDecision(WaveAction.WAIT, "momentum sample span is too short")
 
